@@ -1,0 +1,23 @@
+{
+  "name": "miami-beach-bots-inventory",
+  "version": "2.0.0",
+  "description": "An advanced inventory tracker for the Miami Beach Bots, featuring QR codes, reservations, and more.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "author": "thalia",
+  "license": "ISC",
+  "dependencies": {
+    "bcrypt": "^5.1.1",
+    "ejs": "^3.1.10",
+    "express": "^4.19.2",
+    "express-session": "^1.18.0",
+    "sqlite3": "^5.1.7",
+    "multer": "^1.4.5-lts.1",
+    "fast-csv": "^5.0.1",
+    "qrcode": "^1.5.3"
+  }
+}
+
+
