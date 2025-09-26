@@ -225,14 +225,14 @@ const requireRole = (roles) => (req, res, next) => {
     requireLogin(req, res, () => {
         if (!roles.includes(req.session.user.role)) {
             const errorHtml = `<h1>403 - Access Denied</h1><p>You do not have the required permissions (${roles.join(', ')}) to view this page.</p><a href="/dashboard">Back to Dashboard</a>`;
-            return res.status(403).send(renderPage('Access Denied', req.session.user, errorHtml));
+            return res.status(403).send(renderPage(req, 'Access Denied', req.session.user, errorHtml));
         }
         next();
     });
 };
 
 // 6. VIEW RENDERING ENGINE (HTML Templates)
-const renderPage = (title, user, content, messages = {}) => {
+const renderPage = (req, title, user, content, messages = {}) => {
     const { error, success } = { ...req.session, ...messages };
     if (req.session) {
         delete req.session.error;
@@ -371,7 +371,7 @@ app.get('/dashboard', requireLogin, (req, res) => {
                     </ul>
                 </div>
             `;
-            res.send(renderPage('Dashboard', req.session.user, content));
+            res.send(renderPage(req, 'Dashboard', req.session.user, content));
         });
     });
 });
@@ -399,7 +399,7 @@ app.get('/login', (req, res) => {
             </div>
         </div>
     `;
-    res.send(renderPage('Login', null, content, { error: req.session.error }));
+    res.send(renderPage(req, 'Login', null, content, { error: req.session.error }));
 });
 
 app.post('/login', (req, res) => {
@@ -459,7 +459,7 @@ app.get('/scan', requireLogin, (req, res) => {
             <!-- e.g., using a library like html5-qrcode -->
         </div>
     `;
-    res.send(renderPage('Scan QR Code', req.session.user, content));
+    res.send(renderPage(req, 'Scan QR Code', req.session.user, content));
 });
 
 app.post('/scan-handler', requireLogin, (req, res) => {
@@ -508,7 +508,7 @@ app.get('/quick-action/:id', requireLogin, (req, res) => {
                 </div>
             </div>
         `;
-        res.send(renderPage('Quick Action', req.session.user, content));
+        res.send(renderPage(req, 'Quick Action', req.session.user, content));
     });
 });
 
@@ -545,7 +545,7 @@ app.get('/inventory', requireLogin, (req,res) => {
             </table>
         </div>
         `;
-        res.send(renderPage('Inventory', req.session.user, content));
+        res.send(renderPage(req, 'Inventory', req.session.user, content));
     });
 });
 
@@ -637,7 +637,7 @@ app.get('/users', requireRole(['admin']), (req, res) => {
             </div>
         </div>
         `;
-        res.send(renderPage('User Management', req.session.user, content));
+        res.send(renderPage(req, 'User Management', req.session.user, content));
     });
 });
 
@@ -690,5 +690,6 @@ app.listen(PORT, () => {
     console.log(`Server running on http://localhost:${PORT}`);
     console.log(`For Miami Beach Senior High Robotics Team`);
 });
+
 
 
