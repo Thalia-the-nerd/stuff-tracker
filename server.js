@@ -2,10 +2,10 @@
  * =================================================================
  * Miami Beach Senior High Robotics Team - Inventory Tracker
  * =================================================================
- * Version: 2.4.0 (Functionally Complete)
+ * Version: 2.6.1 (DB Schema Hotfix)
  * Author: Thalia
  * Description: A complete, single-file Node.js application to manage
- * team inventory.
+ * team inventory with advanced admin controls.
  *
  * Features Included:
  * - User Authentication (Admin, Manager, User roles) with Self-Registration
@@ -20,6 +20,10 @@
  * - Bulk CSV Data Import & Export
  * - Admin-notified Password Reset
  * - Comprehensive Audit Log
+ * - Admin user moderation (Timeout/Ban)
+ * - IP address tracking on login
+ * - User-specific audit log and IP history view
+ * - Fine-grained role management for admins
  * =================================================================
  */
 
@@ -35,7 +39,7 @@ const csv = require('fast-csv');
 const QRCode = require('qrcode');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 4899;
 const SALT_ROUNDS = 10;
 const UPLOAD_PATH = 'uploads';
 const IMAGE_PATH = path.join(UPLOAD_PATH, 'images');
@@ -44,6 +48,9 @@ const CSV_PATH = path.join(UPLOAD_PATH, 'csv');
 // Create upload directories if they don't exist
 fs.mkdirSync(IMAGE_PATH, { recursive: true });
 fs.mkdirSync(CSV_PATH, { recursive: true });
+
+// For accurate IP address tracking behind a proxy
+app.set('trust proxy', 1);
 
 // 2. MULTER CONFIGURATION (for file uploads)
 const storage = multer.diskStorage({
@@ -78,7 +85,9 @@ function initializeDb() {
             name TEXT NOT NULL,
             student_id TEXT UNIQUE NOT NULL,
             password TEXT NOT NULL,
-            role TEXT NOT NULL DEFAULT 'user' CHECK(role IN ('admin', 'manager', 'user'))
+            role TEXT NOT NULL DEFAULT 'user' CHECK(role IN ('admin', 'manager', 'user')),
+            status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'timed_out', 'banned')),
+            timeout_until DATETIME
         )`);
         
         db.run(`CREATE TABLE IF NOT EXISTS locations (
@@ -169,8 +178,24 @@ function initializeDb() {
             item_id INTEGER,
             item_name TEXT,
             details TEXT,
+            ip_address TEXT,
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
         )`);
+
+        // --- Schema Integrity Check (Hotfix for existing databases) ---
+        db.all("PRAGMA table_info(audit_log)", (err, columns) => {
+            const hasIpAddressColumn = columns.some(col => col.name === 'ip_address');
+            if (!hasIpAddressColumn) {
+                console.log("Updating audit_log schema: Adding ip_address column...");
+                db.run("ALTER TABLE audit_log ADD COLUMN ip_address TEXT", (alterErr) => {
+                    if (alterErr) {
+                        console.error("Failed to update audit_log schema:", alterErr);
+                    } else {
+                        console.log("Schema updated successfully.");
+                    }
+                });
+            }
+        });
 
         // --- Seed Initial Data ---
         db.get('SELECT * FROM users WHERE student_id = ?', ['admin'], (err, row) => {
@@ -190,12 +215,12 @@ function initializeDb() {
 }
 
 // 4. HELPER FUNCTIONS
-function logAction(user, action, item = null, details = '') {
+function logAction(user, action, item = null, details = '', ip = null) {
     const userId = user ? user.id : null;
     const userName = user ? user.name : 'System';
     const itemId = item ? item.id : null;
-    // Attempt to get item name if not provided directly
     let finalItemName = item ? item.name : null;
+    
     if (itemId && !finalItemName) {
         db.get('SELECT name FROM items WHERE id = ?', [itemId], (err, row) => {
             if (row) {
@@ -204,8 +229,8 @@ function logAction(user, action, item = null, details = '') {
         });
     }
 
-    db.run('INSERT INTO audit_log (user_id, user_name, action, item_id, item_name, details) VALUES (?, ?, ?, ?, ?, ?)',
-        [userId, userName, action, itemId, finalItemName, details]);
+    db.run('INSERT INTO audit_log (user_id, user_name, action, item_id, item_name, details, ip_address) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        [userId, userName, action, itemId, finalItemName, details, ip]);
 }
 
 
@@ -270,7 +295,7 @@ const renderPage = (req, title, user, content, messages = {}) => {
     const generateNavHtml = (links) => {
         return links
             .filter(link => link.roles.includes(userRole))
-            .map(link => `<a href="${link.href}" class="p-3 rounded-lg sidebar-link ${title === link.name ? 'active' : ''}">${link.name}</a>`)
+            .map(link => `<a href="${link.href}" class="p-3 rounded-lg sidebar-link ${title === link.name || title.startsWith(link.name) ? 'active' : ''}">${link.name}</a>`)
             .join('');
     };
 
@@ -292,6 +317,7 @@ const renderPage = (req, title, user, content, messages = {}) => {
                 .btn-primary { @apply bg-sky-600 text-white hover:bg-sky-700; }
                 .btn-secondary { @apply bg-gray-200 text-gray-800 hover:bg-gray-300; }
                 .btn-danger { @apply bg-red-600 text-white hover:bg-red-700; }
+                .btn-warning { @apply bg-amber-500 text-white hover:bg-amber-600; }
                 .card { @apply bg-white rounded-lg shadow-md p-6; }
             </style>
         </head>
@@ -446,10 +472,26 @@ app.post('/login', (req, res) => {
             req.session.error = "Invalid Student ID or password.";
             return res.redirect('/login');
         }
+
+        // Check user status before attempting password verification
+        if (user.status === 'banned') {
+            req.session.error = "This account has been banned.";
+            return res.redirect('/login');
+        }
+        if (user.status === 'timed_out') {
+            if (new Date(user.timeout_until) > new Date()) {
+                req.session.error = `This account is in a timeout until ${new Date(user.timeout_until).toLocaleString()}.`;
+                return res.redirect('/login');
+            } else {
+                // Timeout expired, reactivate account
+                db.run("UPDATE users SET status = 'active', timeout_until = NULL WHERE id = ?", [user.id]);
+            }
+        }
+
         bcrypt.compare(password, user.password, (err, result) => {
             if (result) {
                 req.session.user = user;
-                logAction(user, 'Logged In');
+                logAction(user, 'Logged In', null, '', req.ip);
                 res.redirect('/dashboard');
             } else {
                 req.session.error = "Invalid Student ID or password.";
@@ -512,7 +554,7 @@ app.post('/register', (req, res) => {
                     req.session.error = "Failed to create account.";
                     res.redirect('/register');
                 } else {
-                    logAction(null, 'User Registered', null, `New user: ${name} (${student_id})`);
+                    logAction(null, 'User Registered', null, `New user: ${name} (${student_id})`, req.ip);
                     req.session.success = "Account created successfully! You can now log in.";
                     res.redirect('/login');
                 }
@@ -522,7 +564,7 @@ app.post('/register', (req, res) => {
 });
 
 app.get('/logout', (req, res) => {
-    logAction(req.session.user, 'Logged Out');
+    logAction(req.session.user, 'Logged Out', null, '', req.ip);
     req.session.destroy(() => {
         res.redirect('/login');
     });
@@ -688,7 +730,7 @@ app.post('/inventory/add', requireRole(['admin', 'manager']), upload.single('ite
             res.redirect('/inventory/add');
         } else {
             const newItem = { id: this.lastID, name: name };
-            logAction(req.session.user, 'Created Item', newItem);
+            logAction(req.session.user, 'Created Item', newItem, '', req.ip);
             req.session.success = "Item added successfully.";
             res.redirect('/inventory');
         }
@@ -860,7 +902,7 @@ app.post('/inventory/edit/:id', requireRole(['admin', 'manager']), upload.single
             req.session.error = `Failed to update item. Error: ${err.message}`;
             res.redirect(`/inventory/edit/${itemId}`);
         } else {
-            logAction(req.session.user, 'Updated Item', { id: itemId, name: name });
+            logAction(req.session.user, 'Updated Item', { id: itemId, name: name }, '', req.ip);
             req.session.success = "Item updated successfully.";
             res.redirect(`/inventory/view/${itemId}`);
         }
@@ -884,7 +926,7 @@ app.post('/inventory/delete/:id', requireRole(['admin']), (req, res) => {
                         if (unlinkErr) console.error("Error deleting image file:", unlinkErr);
                     });
                 }
-                logAction(req.session.user, 'Deleted Item', { id: itemId, name: item.name });
+                logAction(req.session.user, 'Deleted Item', { id: itemId, name: item.name }, '', req.ip);
                 req.session.success = `Item "${item.name}" has been permanently deleted.`;
                 res.redirect('/inventory');
             }
@@ -902,7 +944,7 @@ app.post('/inventory/checkout/:id', requireLogin, (req, res) => {
             req.session.error = "Failed to check out item. It may already be checked out or in maintenance.";
         } else {
             req.session.success = "Item checked out successfully!";
-            logAction(req.session.user, 'Checked Out Item', { id: itemId });
+            logAction(req.session.user, 'Checked Out Item', { id: itemId }, '', req.ip);
         }
         res.redirect(req.get('referer') || '/inventory');
     });
@@ -919,7 +961,7 @@ app.post('/inventory/checkin/:id', requireLogin, (req, res) => {
             req.session.error = "Failed to check in item. You may not have it checked out or it is not currently checked out.";
         } else {
             req.session.success = "Item checked in successfully!";
-            logAction(req.session.user, 'Checked In Item', { id: itemId });
+            logAction(req.session.user, 'Checked In Item', { id: itemId }, '', req.ip);
         }
         res.redirect(req.get('referer') || '/inventory');
     });
@@ -934,7 +976,7 @@ app.post('/maintenance/report/:id', requireLogin, (req, res) => {
             req.session.error = "Failed to report issue.";
         } else {
             db.run("UPDATE items SET status = 'Under Maintenance' WHERE id = ?", [itemId]);
-            logAction(req.session.user, 'Reported Maintenance', { id: itemId }, description);
+            logAction(req.session.user, 'Reported Maintenance', { id: itemId }, description, req.ip);
             req.session.success = "Maintenance issue reported. Item status has been updated.";
         }
         res.redirect(`/inventory/view/${itemId}`);
@@ -944,57 +986,213 @@ app.post('/maintenance/report/:id', requireLogin, (req, res) => {
 
 // --- Admin: User Management ---
 app.get('/users', requireRole(['admin']), (req, res) => {
-    db.all("SELECT id, name, student_id, role FROM users", (err, users) => {
-        const usersHtml = users.map(u => `
+    db.all("SELECT * FROM users", (err, users) => {
+        const usersHtml = users.map(u => {
+            let statusBadge = '';
+            switch(u.status) {
+                case 'active': statusBadge = '<span class="bg-green-100 text-green-800 text-xs font-medium px-2.5 py-0.5 rounded-full">Active</span>'; break;
+                case 'timed_out': statusBadge = `<span class="bg-yellow-100 text-yellow-800 text-xs font-medium px-2.5 py-0.5 rounded-full">Timed Out</span>`; break;
+                case 'banned': statusBadge = '<span class="bg-red-100 text-red-800 text-xs font-medium px-2.5 py-0.5 rounded-full">Banned</span>'; break;
+            }
+            // Prevent admins from moderating other admins
+            let actions = u.role === 'admin' ? 'N/A' : `
+                 <a href="/users/view/${u.id}" class="text-sky-600 hover:underline">Details</a>
+            `;
+            
+            return `
              <tr class="border-b">
                 <td class="py-2 px-4">${u.name}</td>
                 <td class="py-2 px-4">${u.student_id}</td>
                 <td class="py-2 px-4 capitalize">${u.role}</td>
-                <td class="py-2 px-4">
-                    <!-- Edit/Delete forms would go here -->
-                </td>
+                <td class="py-2 px-4">${statusBadge}</td>
+                <td class="py-2 px-4">${actions}</td>
             </tr>
-        `).join('');
+            `;
+        }).join('');
+
         const content = `
-        <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
-            <div class="md:col-span-2 card">
-                 <h2 class="text-xl font-bold mb-4">Existing Users</h2>
+        <div class="card">
+             <h2 class="text-xl font-bold mb-4">User Accounts</h2>
+             <div class="overflow-x-auto">
                  <table class="w-full text-left">
                     <thead><tr class="border-b-2">
-                        <th class="py-2 px-4">Name</th><th class="py-2 px-4">Student ID</th><th class="py-2 px-4">Role</th><th class="py-2 px-4">Actions</th>
+                        <th class="py-2 px-4">Name</th><th class="py-2 px-4">Student ID</th><th class="py-2 px-4">Role</th><th class="py-2 px-4">Status</th><th class="py-2 px-4">Actions</th>
                     </tr></thead>
                     <tbody>${usersHtml}</tbody>
                 </table>
-            </div>
-            <div class="card">
-                <h2 class="text-xl font-bold mb-4">Add New User</h2>
-                <form action="/users/add" method="POST">
-                    <div class="mb-4">
-                        <label class="block text-gray-700">Full Name</label>
-                        <input type="text" name="name" class="w-full p-2 border rounded" required>
-                    </div>
-                    <div class="mb-4">
-                        <label class="block text-gray-700">Student ID</label>
-                        <input type="text" name="student_id" class="w-full p-2 border rounded" required>
-                    </div>
-                    <div class="mb-4">
-                        <label class="block text-gray-700">Password</label>
-                        <input type="password" name="password" class="w-full p-2 border rounded" required>
-                    </div>
-                     <div class="mb-4">
-                        <label class="block text-gray-700">Role</label>
-                        <select name="role" class="w-full p-2 border rounded">
-                            <option value="user">User</option>
-                            <option value="manager">Manager</option>
-                            <option value="admin">Admin</option>
-                        </select>
-                    </div>
-                    <button type="submit" class="btn btn-primary w-full">Add User</button>
-                </form>
-            </div>
+             </div>
         </div>
         `;
         res.send(renderPage(req, 'User Management', req.session.user, content));
+    });
+});
+
+app.get('/users/view/:id', requireRole(['admin']), (req, res) => {
+    const userId = req.params.id;
+    db.get("SELECT * FROM users WHERE id = ?", [userId], (err, user) => {
+        if(err || !user) {
+            req.session.error = "User not found.";
+            return res.redirect('/users');
+        }
+
+        db.all("SELECT * FROM audit_log WHERE user_id = ? ORDER BY timestamp DESC", [userId], (err, logs) => {
+            db.all("SELECT DISTINCT ip_address FROM audit_log WHERE user_id = ? AND ip_address IS NOT NULL", [userId], (err, ips) => {
+                
+                const logsHtml = logs.map(l => `
+                    <tr class="border-b">
+                        <td class="p-2">${new Date(l.timestamp).toLocaleString()}</td>
+                        <td class="p-2">${l.action}</td>
+                        <td class="p-2">${l.item_name || 'N/A'}</td>
+                        <td class="p-2">${l.ip_address || 'N/A'}</td>
+                    </tr>
+                `).join('');
+
+                let moderationForm = '';
+                if(user.role !== 'admin') {
+                    if (user.status === 'active') {
+                        moderationForm = `
+                            <form action="/users/timeout/${user.id}" method="POST" class="mb-2">
+                                <label>Duration (hours)</label>
+                                <input type="number" name="duration" value="24" class="p-1 border rounded">
+                                <button type="submit" class="btn btn-warning">Timeout</button>
+                            </form>
+                            <form action="/users/ban/${user.id}" method="POST" onsubmit="return confirm('Ban this user? This is permanent.')">
+                                <button type="submit" class="btn btn-danger">Ban</button>
+                            </form>
+                        `;
+                    } else {
+                         moderationForm = `
+                            <form action="/users/reactivate/${user.id}" method="POST">
+                                <button type="submit" class="btn btn-primary">Reactivate</button>
+                            </form>
+                        `;
+                    }
+                }
+                
+                let roleManagementForm = '';
+                if(user.role !== 'admin') {
+                    roleManagementForm = `
+                        <div class="card mt-6">
+                            <h2 class="text-xl font-bold mb-4">Change Role</h2>
+                            <form action="/users/update-role/${user.id}" method="POST">
+                                <select name="role" class="w-full p-2 border rounded mb-2">
+                                    <option value="user" ${user.role === 'user' ? 'selected' : ''}>User</option>
+                                    <option value="manager" ${user.role === 'manager' ? 'selected' : ''}>Manager</option>
+                                </select>
+                                <button type="submit" class="btn btn-primary w-full">Set Role</button>
+                            </form>
+                        </div>
+                    `;
+                }
+
+                const content = `
+                <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                    <div class="lg:col-span-2">
+                        <div class="card">
+                            <h2 class="text-xl font-bold mb-4">User Audit Log</h2>
+                            <table class="w-full text-sm text-left">
+                                <thead><tr class="border-b-2">
+                                    <th class="p-2">Timestamp</th><th class="p-2">Action</th><th class="p-2">Item</th><th class="p-2">IP</th>
+                                </tr></thead>
+                                <tbody>${logsHtml}</tbody>
+                            </table>
+                        </div>
+                    </div>
+                    <div>
+                        <div class="card">
+                             <h2 class="text-xl font-bold mb-4">User Details</h2>
+                             <p><strong>Name:</strong> ${user.name}</p>
+                             <p><strong>Student ID:</strong> ${user.student_id}</p>
+                             <p><strong>Role:</strong> ${user.role}</p>
+                             <p><strong>Status:</strong> ${user.status}</p>
+                             ${user.status === 'timed_out' ? `<p><strong>Timeout Ends:</strong> ${new Date(user.timeout_until).toLocaleString()}</p>` : ''}
+                        </div>
+                        <div class="card mt-6">
+                            <h2 class="text-xl font-bold mb-4">Moderation</h2>
+                            ${moderationForm}
+                        </div>
+                        ${roleManagementForm}
+                        <div class="card mt-6">
+                            <h2 class="text-xl font-bold mb-4">Known IP Addresses</h2>
+                            <ul class="list-disc list-inside">
+                                ${ips.map(ip => `<li>${ip.ip_address}</li>`).join('')}
+                            </ul>
+                        </div>
+                    </div>
+                </div>
+                `;
+                res.send(renderPage(req, `User Details: ${user.name}`, req.session.user, content));
+            });
+        });
+    });
+});
+
+app.post('/users/update-role/:id', requireRole(['admin']), (req, res) => {
+    const userId = req.params.id;
+    const { role } = req.body;
+    if (!['user', 'manager'].includes(role)) {
+        req.session.error = "Invalid role selected.";
+        return res.redirect(`/users/view/${userId}`);
+    }
+    
+    db.get("SELECT role FROM users WHERE id = ?", [userId], (err, userToUpdate) => {
+        if (err || !userToUpdate) {
+            req.session.error = "User not found.";
+            return res.redirect('/users');
+        }
+        if (userToUpdate.role === 'admin') {
+            req.session.error = "Cannot change the role of an administrator.";
+            return res.redirect('/users');
+        }
+        db.run("UPDATE users SET role = ? WHERE id = ?", [role, userId], function(err) {
+            if (err) {
+                req.session.error = "Failed to update user role.";
+            } else {
+                logAction(req.session.user, 'Updated User Role', null, `Set User ID ${userId} to ${role}`, req.ip);
+                req.session.success = "User role updated successfully.";
+            }
+            res.redirect(`/users/view/${userId}`);
+        });
+    });
+});
+
+app.post('/users/timeout/:id', requireRole(['admin']), (req, res) => {
+    const userId = req.params.id;
+    const durationHours = parseInt(req.body.duration, 10) || 24;
+    const timeoutUntil = new Date();
+    timeoutUntil.setHours(timeoutUntil.getHours() + durationHours);
+
+    db.run("UPDATE users SET status = 'timed_out', timeout_until = ? WHERE id = ? AND role != 'admin'", [timeoutUntil, userId], function(err) {
+        if(err) { req.session.error = "Failed to time out user."; }
+        else {
+            logAction(req.session.user, 'Timed Out User', null, `User ID: ${userId} for ${durationHours} hours.`, req.ip);
+            req.session.success = "User has been placed in timeout.";
+        }
+        res.redirect(`/users/view/${userId}`);
+    });
+});
+
+app.post('/users/ban/:id', requireRole(['admin']), (req, res) => {
+    const userId = req.params.id;
+    db.run("UPDATE users SET status = 'banned' WHERE id = ? AND role != 'admin'", [userId], function(err) {
+         if(err) { req.session.error = "Failed to ban user."; }
+         else {
+             logAction(req.session.user, 'Banned User', null, `User ID: ${userId}`, req.ip);
+             req.session.success = "User has been banned.";
+         }
+        res.redirect(`/users/view/${userId}`);
+    });
+});
+
+app.post('/users/reactivate/:id', requireRole(['admin']), (req, res) => {
+    const userId = req.params.id;
+    db.run("UPDATE users SET status = 'active', timeout_until = NULL WHERE id = ?", [userId], function(err) {
+         if(err) { req.session.error = "Failed to reactivate user."; }
+         else {
+             logAction(req.session.user, 'Reactivated User', null, `User ID: ${userId}`, req.ip);
+             req.session.success = "User has been reactivated.";
+         }
+        res.redirect(`/users/view/${userId}`);
     });
 });
 
@@ -1007,7 +1205,7 @@ app.post('/users/add', requireRole(['admin']), (req, res) => {
                 req.session.error = "Failed to add user. Student ID may already exist.";
             } else {
                 req.session.success = "User added successfully.";
-                logAction(req.session.user, 'Created User', null, `New user: ${name} (${student_id})`);
+                logAction(req.session.user, 'Created User', null, `New user: ${name} (${student_id})`, req.ip);
             }
             res.redirect('/users');
         });
@@ -1052,9 +1250,162 @@ app.post('/request-password-reset', (req, res) => {
 // --- FULLY IMPLEMENTED ROUTES ---
 
 app.get('/reservations', requireLogin, (req, res) => {
-    const content = `<div class="card">Feature coming soon: View and manage item reservations. This will include a calendar view.</div>`;
-    res.send(renderPage(req, 'Reservations', req.session.user, content));
+    const today = new Date();
+    const monthQuery = req.query.month;
+    const yearQuery = req.query.year;
+
+    const month = (monthQuery !== undefined && !isNaN(parseInt(monthQuery, 10))) ? parseInt(monthQuery, 10) : today.getMonth();
+    const year = (yearQuery !== undefined && !isNaN(parseInt(yearQuery, 10))) ? parseInt(yearQuery, 10) : today.getFullYear();
+
+
+    const firstDay = new Date(year, month, 1);
+    const lastDay = new Date(year, month + 1, 0);
+    const monthName = firstDay.toLocaleString('default', { month: 'long' });
+
+    const prevMonth = month === 0 ? 11 : month - 1;
+    const prevYear = month === 0 ? year - 1 : year;
+    const nextMonth = month === 11 ? 0 : month + 1;
+    const nextYear = month === 11 ? year + 1 : year;
+
+    const sql = `
+        SELECT r.id, r.start_date, r.end_date, i.name as item_name, u.name as user_name, r.user_id
+        FROM reservations r
+        JOIN items i ON r.item_id = i.id
+        JOIN users u ON r.user_id = u.id
+        WHERE r.status = 'Active' AND
+              ((start_date BETWEEN ? AND ?) OR (end_date BETWEEN ? AND ?))
+    `;
+    const startDateStr = `${year}-${String(month + 1).padStart(2, '0')}-01`;
+    const endDateStr = `${year}-${String(month + 1).padStart(2, '0')}-${lastDay.getDate()}`;
+
+    db.all(sql, [startDateStr, endDateStr, startDateStr, endDateStr], (err, reservations) => {
+        db.all('SELECT id, name FROM items ORDER BY name', (err, items) => {
+
+            let calendarHtml = '';
+            const daysInMonth = lastDay.getDate();
+            const startingDay = firstDay.getDay();
+
+            for (let i = 0; i < startingDay; i++) {
+                calendarHtml += `<div class="border p-2 bg-gray-50"></div>`;
+            }
+
+            for (let day = 1; day <= daysInMonth; day++) {
+                const currentDate = new Date(year, month, day);
+                const reservationsForDay = reservations.filter(r => {
+                    const start = new Date(r.start_date + 'T00:00:00');
+                    const end = new Date(r.end_date + 'T00:00:00');
+                    return currentDate >= start && currentDate <= end;
+                });
+                
+                let eventsHtml = reservationsForDay.map(r => {
+                     let cancelForm = '';
+                     if(req.session.user.role !== 'user' || r.user_id === req.session.user.id) {
+                         cancelForm = `<form class="inline" action="/reservations/cancel/${r.id}" method="POST"><button class="text-red-500 text-xs hover:underline ml-1">(Cancel)</button></form>`;
+                     }
+                     return `
+                        <li class="bg-sky-100 p-1 rounded">
+                            <p class="font-semibold">${r.item_name}</p>
+                            <p>${r.user_name} ${cancelForm}</p>
+                        </li>`;
+                }).join('');
+
+                calendarHtml += `<div class="border p-2 min-h-[120px]">
+                    <div class="font-bold">${day}</div>
+                    <ul class="text-xs space-y-1 mt-1">
+                        ${eventsHtml}
+                    </ul>
+                </div>`;
+            }
+
+            const content = `
+                <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                    <div class="lg:col-span-2 card">
+                        <div class="flex justify-between items-center mb-4">
+                            <a href="/reservations?year=${prevYear}&month=${prevMonth}" class="btn btn-secondary">&lt; Prev</a>
+                            <h2 class="text-xl font-bold">${monthName} ${year}</h2>
+                            <a href="/reservations?year=${nextYear}&month=${nextMonth}" class="btn btn-secondary">Next &gt;</a>
+                        </div>
+                        <div class="grid grid-cols-7 gap-px bg-gray-200 border">
+                            <div class="text-center font-bold p-2 bg-white">Sun</div>
+                            <div class="text-center font-bold p-2 bg-white">Mon</div>
+                            <div class="text-center font-bold p-2 bg-white">Tue</div>
+                            <div class="text-center font-bold p-2 bg-white">Wed</div>
+                            <div class="text-center font-bold p-2 bg-white">Thu</div>
+                            <div class="text-center font-bold p-2 bg-white">Fri</div>
+                            <div class="text-center font-bold p-2 bg-white">Sat</div>
+                            ${calendarHtml}
+                        </div>
+                    </div>
+                    <div class="card">
+                        <h2 class="text-xl font-bold mb-4">Make a Reservation</h2>
+                        <form action="/reservations" method="POST">
+                            <div class="mb-4">
+                                <label class="block">Item</label>
+                                <select name="item_id" class="w-full p-2 border rounded" required>
+                                    ${items.map(i => `<option value="${i.id}">${i.name}</option>`).join('')}
+                                </select>
+                            </div>
+                            <div class="mb-4">
+                                <label class="block">Start Date</label>
+                                <input type="date" name="start_date" class="w-full p-2 border rounded" required>
+                            </div>
+                             <div class="mb-4">
+                                <label class="block">End Date</label>
+                                <input type="date" name="end_date" class="w-full p-2 border rounded" required>
+                            </div>
+                            <button type="submit" class="btn btn-primary w-full">Reserve Item</button>
+                        </form>
+                    </div>
+                </div>
+            `;
+            res.send(renderPage(req, 'Reservations', req.session.user, content));
+        });
+    });
 });
+
+app.post('/reservations', requireLogin, (req, res) => {
+    const { item_id, start_date, end_date } = req.body;
+    // Conflict check
+    const sql = `SELECT id FROM reservations WHERE item_id = ? AND status = 'Active' AND (
+        (start_date <= ? AND end_date >= ?) OR (start_date BETWEEN ? AND ?)
+    )`;
+    db.get(sql, [item_id, start_date, start_date, start_date, end_date], (err, existing) => {
+        if (existing) {
+            req.session.error = "This item is already reserved during the selected dates.";
+            return res.redirect('/reservations');
+        }
+        db.run('INSERT INTO reservations (item_id, user_id, start_date, end_date) VALUES (?, ?, ?, ?)',
+            [item_id, req.session.user.id, start_date, end_date], function(err) {
+            if (err) {
+                req.session.error = "Failed to create reservation.";
+            } else {
+                req.session.success = "Reservation created successfully.";
+                logAction(req.session.user, 'Created Reservation', { id: item_id }, '', req.ip);
+            }
+            res.redirect('/reservations');
+        });
+    });
+});
+
+app.post('/reservations/cancel/:id', requireLogin, (req, res) => {
+    const reservationId = req.params.id;
+    db.get('SELECT user_id FROM reservations WHERE id = ?', [reservationId], (err, reservation) => {
+        if (req.session.user.role === 'user' && req.session.user.id !== reservation.user_id) {
+            req.session.error = "You can only cancel your own reservations.";
+            return res.redirect('/reservations');
+        }
+        db.run("UPDATE reservations SET status = 'Cancelled' WHERE id = ?", [reservationId], function(err) {
+            if (err) {
+                req.session.error = "Failed to cancel reservation.";
+            } else {
+                req.session.success = "Reservation cancelled.";
+                logAction(req.session.user, 'Cancelled Reservation', { id: reservationId }, '', req.ip);
+            }
+            res.redirect('/reservations');
+        });
+    });
+});
+
 
 app.get('/my-history', requireLogin, (req, res) => {
     const sql = `
@@ -1121,7 +1472,7 @@ app.post('/requests/new', requireLogin, (req, res) => {
             req.session.error = "Failed to submit request.";
             res.redirect('/requests/new');
         } else {
-            logAction(req.session.user, 'Submitted Purchase Request', null, `Item: ${item_name}`);
+            logAction(req.session.user, 'Submitted Purchase Request', null, `Item: ${item_name}`, req.ip);
             req.session.success = "Your purchase request has been submitted for review.";
             res.redirect('/dashboard');
         }
@@ -1129,7 +1480,14 @@ app.post('/requests/new', requireLogin, (req, res) => {
 });
 
 app.get('/reports', requireRole(['admin', 'manager']), (req, res) => {
-    db.get("SELECT status, count(*) as count FROM items GROUP BY status", (err, itemStatusData) => {
+    db.all("SELECT status, count(*) as count FROM items GROUP BY status", (err, itemStatusData) => {
+        if (err) {
+             return res.status(500).send(renderPage(req, 'Error', req.session.user, 'Could not load report data.'));
+        }
+        const availableCount = (itemStatusData.find(s => s.status === 'Available') || {count: 0}).count;
+        const checkedOutCount = (itemStatusData.find(s => s.status === 'Checked Out') || {count: 0}).count;
+        const maintenanceCount = (itemStatusData.find(s => s.status === 'Under Maintenance') || {count: 0}).count;
+
         const content = `
         <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
             <div class="card">
@@ -1138,22 +1496,24 @@ app.get('/reports', requireRole(['admin', 'manager']), (req, res) => {
             </div>
         </div>
         <script>
-            const ctx = document.getElementById('itemStatusChart').getContext('2d');
-            new Chart(ctx, {
-                type: 'doughnut',
-                data: {
-                    labels: ['Available', 'Checked Out', 'Under Maintenance'],
-                    datasets: [{
-                        label: 'Item Status',
-                        data: [
-                            ${(itemStatusData.find(s => s.status === 'Available') || {count:0}).count}, 
-                            ${(itemStatusData.find(s => s.status === 'Checked Out') || {count:0}).count}, 
-                            ${(itemStatusData.find(s => s.status === 'Under Maintenance') || {count:0}).count}
-                        ],
-                        backgroundColor: ['#22c55e', '#f59e0b', '#ef4444'],
-                    }]
-                }
-            });
+            if (document.getElementById('itemStatusChart')) {
+                const ctx = document.getElementById('itemStatusChart').getContext('2d');
+                new Chart(ctx, {
+                    type: 'doughnut',
+                    data: {
+                        labels: ['Available', 'Checked Out', 'Under Maintenance'],
+                        datasets: [{
+                            label: 'Item Status',
+                            data: [
+                                ${availableCount}, 
+                                ${checkedOutCount}, 
+                                ${maintenanceCount}
+                            ],
+                            backgroundColor: ['#22c55e', '#f59e0b', '#ef4444'],
+                        }]
+                    }
+                });
+            }
         </script>
         `;
         res.send(renderPage(req, 'Reports', req.session.user, content));
@@ -1221,7 +1581,7 @@ app.post('/admin/requests/:action/:id', requireRole(['admin', 'manager']), (req,
                 req.session.error = "Failed to update request.";
                 return res.redirect('/admin/requests');
             }
-            logAction(req.session.user, `Purchase Request ${status}`, null, `Request for: ${request.item_name}`);
+            logAction(req.session.user, `Purchase Request ${status}`, null, `Request for: ${request.item_name}`, req.ip);
 
             if (status === 'Approved') {
                 const itemSql = `INSERT INTO items (name, category, manufacturer) VALUES (?, ?, ?)`;
@@ -1290,7 +1650,7 @@ app.post('/admin/password-resets/:id', requireRole(['admin']), (req, res) => {
         bcrypt.hash(new_password, SALT_ROUNDS, (err, hash) => {
             db.run('UPDATE users SET password = ? WHERE id = ?', [hash, reset.user_id], (err) => {
                 db.run('UPDATE password_resets SET status = ? WHERE id = ?', ['Completed', resetId]);
-                logAction(req.session.user, 'Reset User Password', null, `User ID: ${reset.user_id}`);
+                logAction(req.session.user, 'Reset User Password', null, `User ID: ${reset.user_id}`, req.ip);
                 req.session.success = "Password has been reset. Please provide the new password to the user.";
                 res.redirect('/admin/password-resets');
             });
@@ -1329,7 +1689,7 @@ app.post('/locations', requireRole(['admin', 'manager']), (req, res) => {
             req.session.error = "Failed to add location. It may already exist.";
         } else {
             req.session.success = "Location added successfully.";
-            logAction(req.session.user, 'Created Location', null, `Name: ${name}`);
+            logAction(req.session.user, 'Created Location', null, `Name: ${name}`, req.ip);
         }
         res.redirect('/locations');
     });
@@ -1344,6 +1704,7 @@ app.get('/audit-log', requireRole(['admin']), (req, res) => {
                 <td class="py-2 px-4">${l.action}</td>
                 <td class="py-2 px-4">${l.item_name || 'N/A'}</td>
                 <td class="py-2 px-4">${l.details || ''}</td>
+                 <td class="py-2 px-4">${l.ip_address || 'N/A'}</td>
             </tr>
         `).join('');
         const content = `<div class="card">
@@ -1354,6 +1715,7 @@ app.get('/audit-log', requireRole(['admin']), (req, res) => {
                     <th class="py-2 px-4">Action</th>
                     <th class="py-2 px-4">Item</th>
                     <th class="py-2 px-4">Details</th>
+                    <th class="py-2 px-4">IP Address</th>
                 </tr></thead>
                 <tbody>${logsHtml}</tbody>
             </table>
@@ -1412,7 +1774,7 @@ app.post('/data/import', requireRole(['admin']), upload.single('csvFile'), (req,
                     });
                 });
                 stmt.finalize((err) => {
-                    logAction(req.session.user, 'Imported Data', null, `Imported ${successCount} items from CSV. ${errorCount} errors.`);
+                    logAction(req.session.user, 'Imported Data', null, `Imported ${successCount} items from CSV. ${errorCount} errors.`, req.ip);
                     req.session.success = `Successfully imported ${successCount} items. Failed to import ${errorCount} items (likely duplicate serial numbers).`;
                     fs.unlinkSync(req.file.path); // Clean up uploaded file
                     res.redirect('/inventory');
@@ -1437,7 +1799,7 @@ app.get('/data/export/:type', requireRole(['admin']), (req, res) => {
         else { csvStream.write(row); }
     }, () => {
         csvStream.end();
-        logAction(req.session.user, 'Exported Data', null, `Exported ${type} to CSV.`);
+        logAction(req.session.user, 'Exported Data', null, `Exported ${type} to CSV.`, req.ip);
     });
 });
 
