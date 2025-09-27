@@ -2,7 +2,7 @@
  * =================================================================
  * Miami Beach Senior High Robotics Team - Inventory Tracker
  * =================================================================
- * Version: 2.6.1 (DB Schema Hotfix)
+ * Version: 2.7.0 (User Deletion Update)
  * Author: Thalia
  * Description: A complete, single-file Node.js application to manage
  * team inventory with advanced admin controls.
@@ -24,6 +24,7 @@
  * - IP address tracking on login
  * - User-specific audit log and IP history view
  * - Fine-grained role management for admins
+ * - **NEW**: Admins can permanently delete user accounts
  * =================================================================
  */
 
@@ -39,7 +40,7 @@ const csv = require('fast-csv');
 const QRCode = require('qrcode');
 
 const app = express();
-const PORT = process.env.PORT || 4899;
+const PORT = process.env.PORT || 3000;
 const SALT_ROUNDS = 10;
 const UPLOAD_PATH = 'uploads';
 const IMAGE_PATH = path.join(UPLOAD_PATH, 'images');
@@ -113,7 +114,7 @@ function initializeDb() {
             last_activity_date DATETIME,
             is_kit BOOLEAN DEFAULT 0,
             FOREIGN KEY (location_id) REFERENCES locations(id),
-            FOREIGN KEY (checked_out_by_id) REFERENCES users(id)
+            FOREIGN KEY (checked_out_by_id) REFERENCES users(id) ON DELETE SET NULL
         )`);
 
         // --- Feature-Specific Tables ---
@@ -145,7 +146,7 @@ function initializeDb() {
             resolved_date DATETIME,
             resolution_notes TEXT,
             FOREIGN KEY (item_id) REFERENCES items(id) ON DELETE CASCADE,
-            FOREIGN KEY (user_id) REFERENCES users(id)
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
         )`);
 
         db.run(`CREATE TABLE IF NOT EXISTS purchase_requests (
@@ -158,8 +159,8 @@ function initializeDb() {
             request_date DATETIME DEFAULT CURRENT_TIMESTAMP,
             reviewed_by_id INTEGER,
             review_date DATETIME,
-            FOREIGN KEY (requested_by_id) REFERENCES users(id),
-            FOREIGN KEY (reviewed_by_id) REFERENCES users(id)
+            FOREIGN KEY (requested_by_id) REFERENCES users(id) ON DELETE SET NULL,
+            FOREIGN KEY (reviewed_by_id) REFERENCES users(id) ON DELETE SET NULL
         )`);
         
         db.run(`CREATE TABLE IF NOT EXISTS password_resets (
@@ -533,6 +534,7 @@ app.get('/register', (req, res) => {
     res.send(renderPage(req, 'Register', null, content));
 });
 
+// MODIFIED /register ROUTE
 app.post('/register', (req, res) => {
     const { name, student_id, password } = req.body;
 
@@ -547,16 +549,25 @@ app.post('/register', (req, res) => {
                 req.session.error = "An error occurred during registration.";
                 return res.redirect('/register');
             }
-            // New users are always created with the 'user' role
+            
             const sql = 'INSERT INTO users (name, student_id, password, role) VALUES (?, ?, ?, ?)';
             db.run(sql, [name, student_id, hash, 'user'], function(err) {
                 if (err) {
                     req.session.error = "Failed to create account.";
                     res.redirect('/register');
                 } else {
-                    logAction(null, 'User Registered', null, `New user: ${name} (${student_id})`, req.ip);
-                    req.session.success = "Account created successfully! You can now log in.";
-                    res.redirect('/login');
+                    const newUserId = this.lastID;
+                    const newUser = {
+                        id: newUserId,
+                        name: name,
+                        student_id: student_id,
+                        role: 'user',
+                        status: 'active' 
+                    };
+
+                    logAction(newUser, 'User Registered', null, `New user: ${name} (${student_id})`, req.ip);
+                    req.session.user = newUser; // Auto-login
+                    res.redirect('/dashboard');
                 }
             });
         });
@@ -1048,6 +1059,7 @@ app.get('/users/view/:id', requireRole(['admin']), (req, res) => {
                 `).join('');
 
                 let moderationForm = '';
+                let dangerZone = '';
                 if(user.role !== 'admin') {
                     if (user.status === 'active') {
                         moderationForm = `
@@ -1067,6 +1079,15 @@ app.get('/users/view/:id', requireRole(['admin']), (req, res) => {
                             </form>
                         `;
                     }
+                    // Add Delete User form to the Danger Zone
+                    dangerZone = `
+                        <div class="card mt-6 border-t-4 border-red-500">
+                            <h2 class="text-xl font-bold mb-4 text-red-700">Danger Zone</h2>
+                            <form action="/users/delete/${user.id}" method="POST" onsubmit="return confirm('Are you sure you want to permanently delete this user? This action cannot be undone.');">
+                                <button type="submit" class="btn btn-danger w-full">Delete User Permanently</button>
+                            </form>
+                        </div>
+                    `;
                 }
                 
                 let roleManagementForm = '';
@@ -1118,6 +1139,7 @@ app.get('/users/view/:id', requireRole(['admin']), (req, res) => {
                                 ${ips.map(ip => `<li>${ip.ip_address}</li>`).join('')}
                             </ul>
                         </div>
+                        ${dangerZone}
                     </div>
                 </div>
                 `;
@@ -1196,21 +1218,54 @@ app.post('/users/reactivate/:id', requireRole(['admin']), (req, res) => {
     });
 });
 
-app.post('/users/add', requireRole(['admin']), (req, res) => {
-    const { name, student_id, password, role } = req.body;
-    bcrypt.hash(password, SALT_ROUNDS, (err, hash) => {
-        if (err) { /* handle error */ }
-        db.run('INSERT INTO users (name, student_id, password, role) VALUES (?, ?, ?, ?)', [name, student_id, hash, role], function(err) {
+// NEW ROUTE: Delete User
+app.post('/users/delete/:id', requireRole(['admin']), (req, res) => {
+    const userIdToDelete = req.params.id;
+    const adminUserId = req.session.user.id;
+
+    // Safety check: Admin cannot delete themselves
+    if (userIdToDelete == adminUserId) {
+        req.session.error = "You cannot delete your own account.";
+        return res.redirect('/users');
+    }
+
+    db.get('SELECT * FROM users WHERE id = ?', [userIdToDelete], (err, user) => {
+        if (err || !user) {
+            req.session.error = "User not found.";
+            return res.redirect('/users');
+        }
+
+        // Safety check: Do not delete other admins
+        if (user.role === 'admin') {
+            req.session.error = "Administrators cannot be deleted.";
+            return res.redirect(`/users/view/${userIdToDelete}`);
+        }
+
+        // Safety check: Verify the user does not have any items currently checked out
+        db.get('SELECT id, name FROM items WHERE checked_out_by_id = ?', [userIdToDelete], (err, item) => {
             if (err) {
-                req.session.error = "Failed to add user. Student ID may already exist.";
-            } else {
-                req.session.success = "User added successfully.";
-                logAction(req.session.user, 'Created User', null, `New user: ${name} (${student_id})`, req.ip);
+                req.session.error = "Database error while checking for checked-out items.";
+                return res.redirect(`/users/view/${userIdToDelete}`);
             }
-            res.redirect('/users');
+            if (item) {
+                req.session.error = `Cannot delete user. They still have item "${item.name}" checked out. Please check in all items first.`;
+                return res.redirect(`/users/view/${userIdToDelete}`);
+            }
+
+            // Proceed with deletion
+            db.run('DELETE FROM users WHERE id = ?', [userIdToDelete], function(err) {
+                if (err) {
+                    req.session.error = `Failed to delete user. Error: ${err.message}`;
+                    return res.redirect(`/users/view/${userIdToDelete}`);
+                }
+                logAction(req.session.user, 'Deleted User', null, `Deleted user: ${user.name} (ID: ${userIdToDelete})`, req.ip);
+                req.session.success = `User "${user.name}" has been permanently deleted.`;
+                res.redirect('/users');
+            });
         });
     });
 });
+
 
 app.get('/request-password-reset', (req, res) => {
     const content = `<div class="card max-w-md mx-auto">
@@ -1818,9 +1873,9 @@ app.use((req, res, next) => {
 
 
 // 8. START SERVER
-// AFTER
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server running on http://0.0.0.0:${PORT}`);
     console.log(`For Miami Beach Senior High Robotics Team`);
 });
-// Original line
+
+
