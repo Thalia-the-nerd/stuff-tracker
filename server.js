@@ -1818,9 +1818,9 @@ app.use((req, res, next) => {
 
 
 // 8. START SERVER
-
-// Original line
-app.listen(PORT, () => {
-    console.log(`Server running on http://localhost:${PORT}`);
+// AFTER
+app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Server running on http://0.0.0.0:${PORT}`);
     console.log(`For Miami Beach Senior High Robotics Team`);
 });
+// Original line
