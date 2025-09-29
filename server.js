@@ -4,9 +4,6 @@
  * =================================================================
  * Version: 2.7.0 (User Deletion Update)
  * Author: Thalia
- * Description: A complete, single-file Node.js application to manage
- * team inventory with advanced admin controls.
- *
  * Features Included:
  * - User Authentication (Admin, Manager, User roles) with Self-Registration
  * - Full CRUD for Inventory Items with Image Uploads
