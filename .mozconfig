@@ -1,0 +1,119 @@
+// Place this file in the root of the browser's directory after building.
+// Windows: C:\firefox-dev\mozilla-unified\obj-...\dist\bin\
+// Linux:   ~/firefox-dev/mozilla-unified/obj-...\dist\firefox/
+// The first line MUST be a comment
+
+// --- PREFERENCE LOCKDOWN ---
+// Use lockPref() to prevent users from changing these settings, even in about:config.
+
+// --- UI & Search Hardening ---
+// Disable the right-click context menu entirely
+lockPref("dom.event.contextmenu.enabled", false);
+// Disable drag-and-drop of links, text, etc.
+lockPref("nglayout.enable_drag_and_drop", false);
+// Disable the URL bar's search functionality and autofill
+lockPref("keyword.enabled", false);
+lockPref("browser.urlbar.autoFill", false);
+// Prevent saving pages
+lockPref("browser.altClickSave", false);
+// Disable "View Source"
+lockPref("view_source.enabled", false);
+// Disable finding text on the page (Ctrl+F)
+lockPref("findbar.modalHighlight", false);
+lockPref("findbar.highlightAll", false);
+// Disable the developer command line (GCLI)
+lockPref("devtools.gcli.enabled", false);
+// Set DuckDuckGo as the one and only search provider and disable suggestions
+lockPref("browser.search.defaultenginename", "DuckDuckGo");
+lockPref("browser.urlbar.suggest.searches", false);
+lockPref("browser.search.hiddenOneOffs", "Google,Amazon.com,Bing,eBay,Twitter,Wikipedia");
+
+
+// --- Keyboard & Tab Lockdown ---
+// Disable common keyboard shortcuts
+lockPref("browser.quitShortcut.disabled", true); // Disables Ctrl+Q on Linux
+lockPref("browser.showQuitWarning", true);      // Makes quitting more deliberate
+// Disable New Window shortcut (Ctrl+N) and prevent popups
+lockPref("browser.newwindow.disabled", true);
+lockPref("browser.link.open_newwindow.restriction", 0);
+// Disable Open File shortcut (Ctrl+O)
+lockPref("browser.link.open_newwindow", 1); // 1 = current window/tab, 2 = new window, 3 = new tab
+// Prevent opening new tabs and disable "Undo Close Tab"
+lockPref("browser.tabs.closeWindowWithLastTab", true);
+lockPref("browser.sessionstore.max_tabs_undo", 0);
+
+
+// --- Filesystem, Printing, and Download Lockdown ---
+// Completely disable file downloads
+lockPref("browser.download.folderList", 2);
+lockPref("browser.download.manager.showWhenStarting", false);
+lockPref("browser.helperApps.neverAsk.saveToDisk", "application/octet-stream");
+// Disable access to the local filesystem via file:// URI
+lockPref("network.protocol-handler.expose.file", false);
+// Disable printing and print preview
+lockPref("print.always_print_silent", true);
+lockPref("print.save_as_pdf.disabled", true);
+lockPref("print.show_print_progress", false);
+
+
+// --- Network and Proxy Lockdown ---
+// Prevent manual proxy configuration
+lockPref("network.proxy.type", 0); // 0 = direct connection, no proxy
+lockPref("network.proxy.http", "");
+lockPref("network.proxy.http_port", 0);
+// Disable automatic proxy detection (WPAD) which could be a spoofing vector
+lockPref("network.proxy.auto_detect", false);
+// Disable DNS-over-HTTPS (DoH) to prevent bypassing network-level filtering
+lockPref("network.trr.mode", 5); // 5 = Off by choice
+
+
+// --- AI, Prediction, & Feature Lockdown ---
+// Disable all Firefox Suggest features (sponsored and non-sponsored)
+lockPref("browser.urlbar.suggest.quicksuggest.sponsored", false);
+lockPref("browser.urlbar.suggest.quicksuggest.nonsponsored", false);
+// Disable recommendation services (extensions, features)
+lockPref("browser.newtabpage.activity-stream.asrouter.userprefs.cfr.addons", false);
+lockPref("browser.newtabpage.activity-stream.asrouter.userprefs.cfr.features", false);
+// Disable network prediction/prefetching
+lockPref("network.predictor.enabled", false);
+lockPref("network.prefetch-next", false);
+// Disable WebGL, which could be used for advanced fingerprinting or exploits
+lockPref("webgl.disabled", true);
+// Disable the Gamepad API to prevent interaction with connected controllers
+lockPref("dom.gamepad.enabled", false);
+// Disable the WebVR API
+lockPref("dom.vr.enabled", false);
+// Disable Web Speech API (Speech Synthesis and Recognition)
+lockPref("media.webspeech.recognition.enable", false);
+lockPref("media.webspeech.synth.enabled", false);
+// Disable WebUSB API
+lockPref("dom.webusb.enabled", false);
+// Disable WebAssembly (WASM)
+lockPref("javascript.options.wasm", false);
+// Disable Service Workers and Web Workers
+lockPref("dom.serviceWorkers.enabled", false);
+lockPref("dom.workers.enabled", false);
+// Disable Picture-in-Picture mode for videos
+lockPref("media.videocontrols.picture-in-picture.enabled", false);
+// Disable web notifications and Push API
+lockPref("dom.push.enabled", false);
+// Disable clipboard events to prevent programmatic copy/paste
+lockPref("dom.event.clipboardevents.enabled", false);
+// Disable the built-in PDF reader
+lockPref("pdfjs.disabled", true);
+
+
+// --- Session, Cache, and Privacy Hardening ---
+// Disable disk cache entirely, forcing operations into memory
+lockPref("browser.cache.disk.enable", false);
+lockPref("browser.cache.memory.enable", true);
+// Clear caches and history on shutdown to ensure a clean session every time
+lockPref("privacy.sanitize.sanitizeOnShutdown.cache", true);
+lockPref("privacy.sanitize.sanitizeOnShutdown.history", true);
+lockPref("privacy.sanitize.sanitizeOnShutdown.sessions", true);
+lockPref("privacy.sanitize.sanitizeOnShutdown.formdata", true);
+lockPref("privacy.sanitize.sanitizeOnSunday", true);
+// Force Punycode display for Internationalized Domain Names (IDNs) to prevent spoofing
+lockPref("network.IDN_show_punycode", true);
+
+

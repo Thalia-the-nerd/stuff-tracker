@@ -2,28 +2,29 @@
  * =================================================================
  * Miami Beach Senior High Robotics Team - Inventory Tracker
  * =================================================================
- * Version: 2.7.0 (User Deletion Update)
- * Author: Thalia
- * Features Included:
- * - User Authentication (Admin, Manager, User roles) with Self-Registration
- * - Full CRUD for Inventory Items with Image Uploads
- * - QR Code Generation & Scanning for quick actions
- * - Item Reservations System
- * - Location/Cabinet Management
- * - Maintenance Logging and Status
- * - Purchase Request & Approval System
- * - User-Specific Item History
- * - Advanced Reporting Dashboard with Charts
- * - Bulk CSV Data Import & Export
- * - Admin-notified Password Reset
- * - Comprehensive Audit Log
- * - Admin user moderation (Timeout/Ban)
- * - IP address tracking on login
- * - User-specific audit log and IP history view
- * - Fine-grained role management for admins
- * - **NEW**: Admins can permanently delete user accounts
+ * Version: 4.0.2 (Critical Bugfix Release)
+ * Author: Thalia (with major feature additions and fixes by Gemini)
+ * Description: A complete, single-file Node.js application to manage
+ * team inventory with a global search, project-based checkouts,
+ * advanced user profiles, consumable item tracking, and much more.
+ *
+ * Change Log (v4.0.2):
+ * - BUGFIX (Critical): Fixed server crash on login (Bad Gateway error) by adding proper error handling to the dashboard's activity feed query.
+ * - BUGFIX (Critical): Corrected routing order for /projects, /my-items, and /profile pages to prevent 404 errors. All new feature routes are now correctly placed before the 404 handler.
+ *
+ * Change Log (v4.0.1):
+ * - BUGFIX: Fixed broken form submission for adding kit components and related items due to a template literal error.
+ * - BUGFIX: Corrected logic on "My Checked-Out Items" and user profile pages to accurately display all items checked out by a user.
+ *
+ * Change Log (v4.0.0):
+ * - FEATURE: Consumable Items, Item Archiving, Bulk Editing, Related Items, Global Search Bar.
+ * - FEATURE: Enhanced User Profiles, "My Checked-Out Items" Page.
+ * - FEATURE: Advanced Report Filtering, New "Item Utilization" and "User Activity" reports.
+ * - FEATURE: Project-Based Checkouts.
+ *
  * =================================================================
  */
+
 
 // 1. DEPENDENCIES & INITIAL SETUP
 const express = require('express');
@@ -35,13 +36,16 @@ const multer = require('multer');
 const fs = require('fs');
 const csv = require('fast-csv');
 const QRCode = require('qrcode');
+const crypto = require('crypto');
+const http = require('http'); // For webhooks
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 4899;
 const SALT_ROUNDS = 10;
 const UPLOAD_PATH = 'uploads';
 const IMAGE_PATH = path.join(UPLOAD_PATH, 'images');
 const CSV_PATH = path.join(UPLOAD_PATH, 'csv');
+const RESERVATION_LIMIT_DAYS = 14;
 
 // Create upload directories if they don't exist
 fs.mkdirSync(IMAGE_PATH, { recursive: true });
@@ -87,7 +91,7 @@ function initializeDb() {
             status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'timed_out', 'banned')),
             timeout_until DATETIME
         )`);
-        
+
         db.run(`CREATE TABLE IF NOT EXISTS locations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT UNIQUE NOT NULL
@@ -97,6 +101,7 @@ function initializeDb() {
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
             quantity INTEGER DEFAULT 1,
+            quantity_checked_out INTEGER DEFAULT 0,
             model_number TEXT,
             serial_number TEXT UNIQUE,
             manufacturer TEXT,
@@ -106,10 +111,12 @@ function initializeDb() {
             location_id INTEGER,
             comment TEXT,
             image_url TEXT,
-            status TEXT DEFAULT 'Available' CHECK(status IN ('Available', 'Checked Out', 'Under Maintenance')),
+            status TEXT DEFAULT 'Available' CHECK(status IN ('Available', 'Checked Out', 'Under Maintenance', 'Archived')),
             checked_out_by_id INTEGER,
             last_activity_date DATETIME,
             is_kit BOOLEAN DEFAULT 0,
+            is_consumable BOOLEAN DEFAULT 0,
+            low_stock_threshold INTEGER,
             FOREIGN KEY (location_id) REFERENCES locations(id),
             FOREIGN KEY (checked_out_by_id) REFERENCES users(id) ON DELETE SET NULL
         )`);
@@ -123,6 +130,35 @@ function initializeDb() {
             FOREIGN KEY (item_id) REFERENCES items(id) ON DELETE CASCADE
         )`);
 
+        db.run(`CREATE TABLE IF NOT EXISTS related_items (
+            item_a_id INTEGER,
+            item_b_id INTEGER,
+            PRIMARY KEY (item_a_id, item_b_id),
+            FOREIGN KEY (item_a_id) REFERENCES items(id) ON DELETE CASCADE,
+            FOREIGN KEY (item_b_id) REFERENCES items(id) ON DELETE CASCADE
+        )`);
+
+        db.run(`CREATE TABLE IF NOT EXISTS projects (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            description TEXT,
+            status TEXT DEFAULT 'Active',
+            created_by_id INTEGER,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (created_by_id) REFERENCES users(id) ON DELETE SET NULL
+        )`);
+
+        db.run(`CREATE TABLE IF NOT EXISTS project_checkouts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER,
+            item_id INTEGER,
+            user_id INTEGER,
+            checkout_date DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
+            FOREIGN KEY (item_id) REFERENCES items(id) ON DELETE CASCADE,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
+        )`);
+
         db.run(`CREATE TABLE IF NOT EXISTS reservations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             item_id INTEGER NOT NULL,
@@ -130,6 +166,9 @@ function initializeDb() {
             start_date DATE NOT NULL,
             end_date DATE NOT NULL,
             status TEXT DEFAULT 'Active' CHECK(status IN ('Active', 'Completed', 'Cancelled')),
+            extension_status TEXT DEFAULT 'None' CHECK(extension_status IN ('None', 'Pending', 'Approved', 'Denied')),
+            requested_end_date DATE,
+            extension_reason TEXT,
             FOREIGN KEY (item_id) REFERENCES items(id) ON DELETE CASCADE,
             FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
         )`);
@@ -148,7 +187,7 @@ function initializeDb() {
 
         db.run(`CREATE TABLE IF NOT EXISTS purchase_requests (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            requested_by_id INTEGER NOT NULL,
+            requested_by_id INTEGER,
             item_name TEXT NOT NULL,
             reason TEXT,
             link TEXT,
@@ -159,7 +198,7 @@ function initializeDb() {
             FOREIGN KEY (requested_by_id) REFERENCES users(id) ON DELETE SET NULL,
             FOREIGN KEY (reviewed_by_id) REFERENCES users(id) ON DELETE SET NULL
         )`);
-        
+
         db.run(`CREATE TABLE IF NOT EXISTS password_resets (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
@@ -180,20 +219,32 @@ function initializeDb() {
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
         )`);
 
-        // --- Schema Integrity Check (Hotfix for existing databases) ---
-        db.all("PRAGMA table_info(audit_log)", (err, columns) => {
-            const hasIpAddressColumn = columns.some(col => col.name === 'ip_address');
-            if (!hasIpAddressColumn) {
-                console.log("Updating audit_log schema: Adding ip_address column...");
-                db.run("ALTER TABLE audit_log ADD COLUMN ip_address TEXT", (alterErr) => {
-                    if (alterErr) {
-                        console.error("Failed to update audit_log schema:", alterErr);
-                    } else {
-                        console.log("Schema updated successfully.");
-                    }
-                });
-            }
-        });
+        // --- Schema Integrity Checks (Hotfixes for existing databases) ---
+        function checkAndAddColumn(table, column, definition) {
+            db.all(`PRAGMA table_info(${table})`, (err, columns) => {
+                if (err) return;
+                const hasColumn = columns.some(col => col.name === column);
+                if (!hasColumn) {
+                    console.log(`Updating ${table} schema: Adding ${column} column...`);
+                    db.run(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`, (alterErr) => {
+                        if (alterErr) console.error(`Failed to update ${table} schema:`, alterErr);
+                        else console.log(`Schema for ${table} updated successfully.`);
+                    });
+                }
+            });
+        }
+        // v3 -> v4 additions
+        checkAndAddColumn('items', 'is_consumable', 'BOOLEAN DEFAULT 0');
+        checkAndAddColumn('items', 'low_stock_threshold', 'INTEGER');
+
+        // Older hotfixes
+        checkAndAddColumn('audit_log', 'ip_address', 'TEXT');
+        checkAndAddColumn('reservations', 'extension_status', "TEXT DEFAULT 'None' CHECK(extension_status IN ('None', 'Pending', 'Approved', 'Denied'))");
+        checkAndAddColumn('reservations', 'requested_end_date', 'DATE');
+        checkAndAddColumn('reservations', 'extension_reason', 'TEXT');
+        checkAndAddColumn('items', 'is_kit', 'BOOLEAN DEFAULT 0');
+        checkAndAddColumn('items', 'quantity_checked_out', 'INTEGER DEFAULT 0');
+
 
         // --- Seed Initial Data ---
         db.get('SELECT * FROM users WHERE student_id = ?', ['admin'], (err, row) => {
@@ -207,7 +258,7 @@ function initializeDb() {
             }
         });
         db.get('SELECT * FROM locations WHERE name = ?', ['Main Cabinet'], (err, row) => {
-            if(!row) db.run('INSERT INTO locations (name) VALUES (?)', ['Main Cabinet']);
+            if (!row) db.run('INSERT INTO locations (name) VALUES (?)', ['Main Cabinet']);
         });
     });
 }
@@ -217,30 +268,28 @@ function logAction(user, action, item = null, details = '', ip = null) {
     const userId = user ? user.id : null;
     const userName = user ? user.name : 'System';
     const itemId = item ? item.id : null;
-    let finalItemName = item ? item.name : null;
-    
-    if (itemId && !finalItemName) {
-        db.get('SELECT name FROM items WHERE id = ?', [itemId], (err, row) => {
-            if (row) {
-                 db.run('UPDATE audit_log SET item_name = ? WHERE item_id = ? AND item_name IS NULL', [row.name, itemId]);
-            }
-        });
-    }
+    const itemName = item ? item.name : null;
 
     db.run('INSERT INTO audit_log (user_id, user_name, action, item_id, item_name, details, ip_address) VALUES (?, ?, ?, ?, ?, ?, ?)',
-        [userId, userName, action, itemId, finalItemName, details, ip]);
+        [userId, userName, action, itemId, itemName, details, ip]);
 }
 
 
 // 5. MIDDLEWARE
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
-app.use('/uploads', express.static(path.join(__dirname, 'uploads'))); // Serve uploaded files
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+
+// SECURITY: Use environment variables for session secret in production.
+const sessionSecret = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
+if (process.env.SESSION_SECRET === undefined) {
+    console.warn('WARNING: SESSION_SECRET is not set. Using a temporary secret. Please set this in your environment for production.');
+}
+
 app.use(session({
-    secret: 'miami-beach-bots-are-the-best-bots',
+    secret: sessionSecret,
     resave: false,
     saveUninitialized: true,
-    cookie: { secure: false } // Set to true if using HTTPS
 }));
 
 // Auth Middleware
@@ -270,21 +319,23 @@ const renderPage = (req, title, user, content, messages = {}) => {
         delete req.session.success;
     }
     const userRole = user ? user.role : '';
-    
-    // Define navigation structure based on roles
+
     const navLinks = [
         { name: 'Dashboard', href: '/dashboard', roles: ['admin', 'manager', 'user'] },
         { name: 'Inventory', href: '/inventory', roles: ['admin', 'manager', 'user'] },
+        { name: 'Projects', href: '/projects', roles: ['admin', 'manager', 'user'] },
         { name: 'Scan QR Code', href: '/scan', roles: ['admin', 'manager', 'user'] },
-        { name: 'Reservations', href: '/reservations', roles: ['admin', 'manager', 'user'] },
-        { name: 'My History', href: '/my-history', roles: ['admin', 'manager', 'user'] },
+        { name: 'My Checked-Out Items', href: '/my-items', roles: ['admin', 'manager', 'user'] },
+        { name: 'My Reservations', href: '/my-reservations', roles: ['admin', 'manager', 'user'] },
         { name: 'Request Item', href: '/requests/new', roles: ['admin', 'manager', 'user'] },
     ];
     const adminLinks = [
         { name: 'Reports', href: '/reports', roles: ['admin', 'manager'] },
+        { name: 'All Reservations', href: '/admin/all-reservations', roles: ['admin', 'manager'] },
         { name: 'Purchase Requests', href: '/admin/requests', roles: ['admin', 'manager'] },
+        { name: 'Extension Requests', href: '/admin/extensions', roles: ['admin', 'manager'] },
         { name: 'User Management', href: '/users', roles: ['admin'] },
-        { name: 'Password Resets', href: '/admin/password-resets', roles: ['admin']},
+        { name: 'Password Resets', href: '/admin/password-resets', roles: ['admin'] },
         { name: 'Locations/Cabinets', href: '/locations', roles: ['admin', 'manager'] },
         { name: 'Audit Log', href: '/audit-log', roles: ['admin'] },
         { name: 'Data Management', href: '/data', roles: ['admin'] },
@@ -304,29 +355,47 @@ const renderPage = (req, title, user, content, messages = {}) => {
             <meta charset="UTF-8">
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
             <title>${title} | MBSH Robotics</title>
+            <link rel="preconnect" href="https://fonts.googleapis.com">
+            <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+            <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
             <script src="https://cdn.tailwindcss.com"></script>
             <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
             <style>
                 body { font-family: 'Inter', sans-serif; }
-                @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
                 .sidebar-link { transition: all 0.2s; }
                 .sidebar-link:hover, .sidebar-link.active { background-color: #0369a1; color: white; } /* sky-700 */
-                .btn { @apply font-bold py-2 px-4 rounded-lg transition-colors; }
+                .btn { @apply font-bold py-2 px-4 rounded-lg transition-colors shadow-sm; }
                 .btn-primary { @apply bg-sky-600 text-white hover:bg-sky-700; }
                 .btn-secondary { @apply bg-gray-200 text-gray-800 hover:bg-gray-300; }
                 .btn-danger { @apply bg-red-600 text-white hover:bg-red-700; }
                 .btn-warning { @apply bg-amber-500 text-white hover:bg-amber-600; }
-                .card { @apply bg-white rounded-lg shadow-md p-6; }
+                .card { @apply bg-white rounded-xl shadow-md p-4 md:p-6; }
             </style>
         </head>
         <body class="h-full">
-            <div class="min-h-full flex">
+            <div class="min-h-full">
                 ${user ? `
-                <aside class="w-64 bg-gray-800 text-gray-200 flex flex-col p-4 space-y-1 fixed h-full overflow-y-auto">
-                    <h1 class="text-xl font-bold mb-4 text-white">
-                        MBSH Robotics<br/>
-                        <span class="text-sky-400 font-semibold">Inventory System</span>
-                    </h1>
+                <!-- Mobile header -->
+                <header class="lg:hidden bg-gray-800 text-white p-4 flex justify-between items-center sticky top-0 z-20 shadow-lg">
+                    <h1 class="text-lg font-bold">${title}</h1>
+                    <button id="menu-btn" class="p-2">
+                        <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16" />
+                        </svg>
+                    </button>
+                </header>
+                
+                <!-- Sidebar -->
+                <aside id="sidebar" class="w-64 bg-gray-800 text-gray-200 flex flex-col p-4 space-y-1 fixed h-full overflow-y-auto z-30 transform -translate-x-full lg:translate-x-0 transition-transform duration-300 ease-in-out">
+                    <div class="mb-4">
+                        <h1 class="text-xl font-bold text-white">
+                            MBSH Robotics<br/>
+                            <span class="text-sky-400 font-semibold">Inventory System</span>
+                        </h1>
+                        <form action="/search" method="GET" class="mt-4">
+                           <input type="search" name="q" placeholder="Search items or users..." class="w-full p-2 rounded-lg bg-gray-700 text-white placeholder-gray-400 border-gray-600 focus:ring-sky-500 focus:border-sky-500">
+                        </form>
+                    </div>
                     <nav class="flex flex-col space-y-1">
                         ${generateNavHtml(navLinks)}
                     </nav>
@@ -338,57 +407,94 @@ const renderPage = (req, title, user, content, messages = {}) => {
                     </div>
                     <div class="flex-grow"></div>
                     <div class="text-sm">
-                        <p>Logged in as: <span class="font-semibold">${user.name}</span></p>
+                        <p>Logged in as: <a href="/profile" class="font-semibold hover:underline">${user.name}</a></p>
                         <p class="text-xs text-gray-400 capitalize">Role: ${user.role}</p>
                         <a href="/logout" class="block w-full mt-4 btn btn-danger text-center">Logout</a>
                     </div>
                 </aside>` : ''}
-                <div class="flex-1 ${user ? 'ml-64' : ''} p-6 md:p-10">
-                    <main>
-                        <h1 class="text-3xl font-bold text-gray-800 mb-6">${title}</h1>
-                        ${error ? `<div class="mb-4 p-4 bg-red-100 text-red-800 border border-red-300 rounded-lg">${error}</div>` : ''}
-                        ${success ? `<div class="mb-4 p-4 bg-green-100 text-green-800 border border-green-300 rounded-lg">${success}</div>` : ''}
+                
+                <!-- Main Content -->
+                <div class="flex-1 ${user ? 'lg:ml-64' : ''}">
+                    <main class="p-4 md:p-10">
+                        <h1 class="hidden lg:block text-3xl font-bold text-gray-800 mb-6">${title}</h1>
+                        ${error ? `<div class="mb-4 p-4 bg-red-100 text-red-800 border border-red-300 rounded-lg shadow">${error}</div>` : ''}
+                        ${success ? `<div class="mb-4 p-4 bg-green-100 text-green-800 border border-green-300 rounded-lg shadow">${success}</div>` : ''}
                         ${content}
                     </main>
                 </div>
             </div>
+            ${user ? `
+            <div id="sidebar-overlay" class="fixed inset-0 bg-black bg-opacity-50 z-20 hidden lg:hidden"></div>
+            <script>
+                const menuBtn = document.getElementById('menu-btn');
+                const sidebar = document.getElementById('sidebar');
+                const overlay = document.getElementById('sidebar-overlay');
+
+                if (menuBtn && sidebar && overlay) {
+                    menuBtn.addEventListener('click', () => {
+                        sidebar.classList.toggle('-translate-x-full');
+                        overlay.classList.toggle('hidden');
+                    });
+                    overlay.addEventListener('click', () => {
+                        sidebar.classList.add('-translate-x-full');
+                        overlay.classList.add('hidden');
+                    });
+                }
+            </script>
+            ` : ''}
         </body>
         </html>
     `;
 };
 
 // 7. APPLICATION ROUTES
+
 // --- Root and Dashboard ---
 app.get('/', (req, res) => res.redirect('/dashboard'));
 
 app.get('/dashboard', requireLogin, (req, res) => {
-    // Complex query to get all dashboard data at once
     const sql = `
         SELECT
-            (SELECT COUNT(*) FROM items) as total_items,
-            (SELECT COUNT(*) FROM items WHERE status = 'Checked Out') as checked_out_items,
+            (SELECT COUNT(*) FROM items WHERE status != 'Archived') as total_items,
+            (SELECT SUM(quantity_checked_out) FROM items) as checked_out_items,
             (SELECT COUNT(*) FROM items WHERE status = 'Under Maintenance') as maintenance_items,
             (SELECT COUNT(*) FROM purchase_requests WHERE status = 'Pending') as pending_requests,
             (SELECT COUNT(*) FROM users) as total_users,
+            (SELECT COUNT(*) FROM reservations WHERE extension_status = 'Pending') as pending_extensions,
             (SELECT COUNT(*) FROM password_resets WHERE status = 'Pending') as pending_resets
     `;
     db.get(sql, (err, stats) => {
-        if(err) {
+        if (err) {
             return res.status(500).send(renderPage(req, 'Error', req.session.user, 'Could not load dashboard data.'));
         }
-        db.all(`SELECT al.*, i.name as item_name FROM audit_log al LEFT JOIN items i ON al.item_id = i.id ORDER BY timestamp DESC LIMIT 5`, (err, recent_activity) => {
+        db.all(`SELECT al.*, i.name as item_name FROM audit_log al LEFT JOIN items i ON al.item_id = i.id WHERE al.user_id = ? ORDER BY timestamp DESC LIMIT 5`, [req.session.user.id], (err, recent_activity) => {
+            if (err) { // BUGFIX: Added error handling to prevent crash on login
+                req.session.error = "Could not load recent activity.";
+                return res.status(500).send(renderPage(req, 'Dashboard', req.session.user, 'Error loading activity feed.'));
+            }
+
             let admin_cards = '';
-            if (req.session.user.role === 'admin') {
+            if (req.session.user.role !== 'user') {
                 admin_cards = `
+                    <div class="card text-center bg-cyan-50">
+                        <a href="/admin/extensions" class="block">
+                            <h2 class="text-4xl font-bold text-cyan-600">${stats.pending_extensions || 0}</h2>
+                            <p class="text-gray-500">Pending Extensions</p>
+                        </a>
+                    </div>
+                `;
+            }
+            if (req.session.user.role === 'admin') {
+                admin_cards += `
                     <div class="card text-center bg-orange-50">
                         <a href="/admin/password-resets" class="block">
-                            <h2 class="text-4xl font-bold text-orange-600">${stats.pending_resets}</h2>
+                            <h2 class="text-4xl font-bold text-orange-600">${stats.pending_resets || 0}</h2>
                             <p class="text-gray-500">Pending Password Resets</p>
                         </a>
                     </div>
                     <div class="card text-center">
                         <a href="/users" class="block">
-                            <h2 class="text-4xl font-bold text-gray-600">${stats.total_users}</h2>
+                            <h2 class="text-4xl font-bold text-gray-600">${stats.total_users || 0}</h2>
                             <p class="text-gray-500">Total Users</p>
                         </a>
                     </div>
@@ -398,39 +504,86 @@ app.get('/dashboard', requireLogin, (req, res) => {
                 <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
                     <div class="card text-center">
                         <a href="/inventory" class="block">
-                            <h2 class="text-4xl font-bold text-sky-600">${stats.total_items}</h2>
-                            <p class="text-gray-500">Total Items</p>
+                            <h2 class="text-4xl font-bold text-sky-600">${stats.total_items || 0}</h2>
+                            <p class="text-gray-500">Total Unique Items</p>
                         </a>
                     </div>
                     <div class="card text-center">
-                        <h2 class="text-4xl font-bold text-yellow-600">${stats.checked_out_items}</h2>
-                        <p class="text-gray-500">Items Checked Out</p>
+                         <a href="/my-items" class="block">
+                            <h2 class="text-4xl font-bold text-yellow-600">${stats.checked_out_items || 0}</h2>
+                            <p class="text-gray-500">Individual Items Checked Out</p>
+                        </a>
                     </div>
                      <div class="card text-center">
-                        <h2 class="text-4xl font-bold text-red-600">${stats.maintenance_items}</h2>
+                        <h2 class="text-4xl font-bold text-red-600">${stats.maintenance_items || 0}</h2>
                         <p class="text-gray-500">Items in Maintenance</p>
                     </div>
                     <div class="card text-center">
                          <a href="/admin/requests" class="block">
-                            <h2 class="text-4xl font-bold text-blue-600">${stats.pending_requests}</h2>
+                            <h2 class="text-4xl font-bold text-blue-600">${stats.pending_requests || 0}</h2>
                             <p class="text-gray-500">Pending Purchase Requests</p>
                         </a>
                     </div>
                     ${admin_cards}
                 </div>
                 <div class="mt-8 card">
-                    <h2 class="text-xl font-bold mb-4">Recent Activity</h2>
+                    <h2 class="text-xl font-bold mb-4">Your Recent Activity</h2>
                     <ul class="divide-y divide-gray-200">
                         ${recent_activity.length > 0 ? recent_activity.map(log => `
                             <li class="py-3">
-                                <p><span class="font-semibold">${log.user_name}</span> ${log.action} ${log.item_name ? `(<a href="/inventory/view/${log.item_id}" class="text-sky-600 hover:underline">${log.item_name}</a>)` : ''}</p>
+                                <p><span class="font-semibold">You</span> ${log.action} ${log.item_name ? `(<a href="/inventory/view/${log.item_id}" class="text-sky-600 hover:underline">${log.item_name}</a>)` : ''}</p>
                                 <p class="text-sm text-gray-500">${new Date(log.timestamp).toLocaleString()}</p>
                             </li>
-                        `).join('') : '<p>No recent activity.</p>'}
+                        `).join('') : '<p>You have no recent activity.</p>'}
                     </ul>
                 </div>
             `;
             res.send(renderPage(req, 'Dashboard', req.session.user, content));
+        });
+    });
+});
+
+// --- Search ---
+app.get('/search', requireLogin, (req, res) => {
+    const query = req.query.q;
+    if (!query) {
+        return res.redirect('/dashboard');
+    }
+    const searchTerm = `%${query}%`;
+    const itemSql = `SELECT id, name, category, serial_number FROM items WHERE status != 'Archived' AND (name LIKE ? OR category LIKE ? OR serial_number LIKE ? OR model_number LIKE ?)`;
+    const userSql = `SELECT id, name, student_id FROM users WHERE name LIKE ? OR student_id LIKE ?`;
+
+    db.all(itemSql, [searchTerm, searchTerm, searchTerm, searchTerm], (err, items) => {
+        db.all(userSql, [searchTerm, searchTerm], (err, users) => {
+            const content = `
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                    <div class="card">
+                        <h2 class="text-2xl font-bold mb-4">Item Results</h2>
+                        ${items.length > 0 ? `
+                        <ul class="divide-y">
+                           ${items.map(item => `
+                           <li class="py-2">
+                                <a href="/inventory/view/${item.id}" class="font-semibold text-sky-600 hover:underline">${item.name}</a>
+                                <p class="text-sm text-gray-500">${item.category || ''} - S/N: ${item.serial_number || 'N/A'}</p>
+                           </li>`).join('')}
+                        </ul>
+                        ` : '<p>No items found.</p>'}
+                    </div>
+                     <div class="card">
+                        <h2 class="text-2xl font-bold mb-4">User Results</h2>
+                        ${users.length > 0 ? `
+                        <ul class="divide-y">
+                           ${users.map(user => `
+                           <li class="py-2">
+                                <a href="/profile/${user.id}" class="font-semibold text-sky-600 hover:underline">${user.name}</a>
+                                <p class="text-sm text-gray-500">ID: ${user.student_id}</p>
+                           </li>`).join('')}
+                        </ul>
+                        ` : '<p>No users found.</p>'}
+                    </div>
+                </div>
+            `;
+            res.send(renderPage(req, `Search Results for "${query}"`, req.session.user, content));
         });
     });
 });
@@ -471,7 +624,6 @@ app.post('/login', (req, res) => {
             return res.redirect('/login');
         }
 
-        // Check user status before attempting password verification
         if (user.status === 'banned') {
             req.session.error = "This account has been banned.";
             return res.redirect('/login');
@@ -481,7 +633,6 @@ app.post('/login', (req, res) => {
                 req.session.error = `This account is in a timeout until ${new Date(user.timeout_until).toLocaleString()}.`;
                 return res.redirect('/login');
             } else {
-                // Timeout expired, reactivate account
                 db.run("UPDATE users SET status = 'active', timeout_until = NULL WHERE id = ?", [user.id]);
             }
         }
@@ -531,12 +682,11 @@ app.get('/register', (req, res) => {
     res.send(renderPage(req, 'Register', null, content));
 });
 
-// MODIFIED /register ROUTE
 app.post('/register', (req, res) => {
     const { name, student_id, password } = req.body;
 
     db.get('SELECT id FROM users WHERE student_id = ?', [student_id], (err, row) => {
-        if(row) {
+        if (row) {
             req.session.error = "A user with that Student ID already exists.";
             return res.redirect('/register');
         }
@@ -546,9 +696,9 @@ app.post('/register', (req, res) => {
                 req.session.error = "An error occurred during registration.";
                 return res.redirect('/register');
             }
-            
+
             const sql = 'INSERT INTO users (name, student_id, password, role) VALUES (?, ?, ?, ?)';
-            db.run(sql, [name, student_id, hash, 'user'], function(err) {
+            db.run(sql, [name, student_id, hash, 'user'], function (err) {
                 if (err) {
                     req.session.error = "Failed to create account.";
                     res.redirect('/register');
@@ -559,11 +709,11 @@ app.post('/register', (req, res) => {
                         name: name,
                         student_id: student_id,
                         role: 'user',
-                        status: 'active' 
+                        status: 'active'
                     };
 
                     logAction(newUser, 'User Registered', null, `New user: ${name} (${student_id})`, req.ip);
-                    req.session.user = newUser; // Auto-login
+                    req.session.user = newUser;
                     res.redirect('/dashboard');
                 }
             });
@@ -625,7 +775,7 @@ app.get('/quick-action/:id', requireLogin, (req, res) => {
         if (item.status === 'Available') {
             actionButton = `<form action="/inventory/checkout/${item.id}" method="POST"><button type="submit" class="btn btn-primary w-full text-lg">Check Out</button></form>`;
         } else if (item.status === 'Checked Out' && (item.checked_out_by_id === req.session.user.id || req.session.user.role !== 'user')) {
-             actionButton = `<form action="/inventory/checkin/${item.id}" method="POST"><button type="submit" class="btn btn-secondary w-full text-lg">Check In</button></form>`;
+            actionButton = `<form action="/inventory/checkin/${item.id}" method="POST"><button type="submit" class="btn btn-secondary w-full text-lg">Check In</button></form>`;
         }
 
         const content = `
@@ -641,6 +791,7 @@ app.get('/quick-action/:id', requireLogin, (req, res) => {
                             ${item.status === 'Available' ? 'bg-green-100 text-green-800' : ''}
                             ${item.status === 'Checked Out' ? 'bg-yellow-100 text-yellow-800' : ''}
                             ${item.status === 'Under Maintenance' ? 'bg-red-100 text-red-800' : ''}
+                            ${item.status === 'Archived' ? 'bg-gray-100 text-gray-800' : ''}
                         ">${item.status}</span></p>
                         ${item.status === 'Checked Out' ? `<p class="mb-4"><strong>Checked out by:</strong> ${item.checked_out_by_name}</p>` : ''}
                         <div class="mt-6">
@@ -658,45 +809,213 @@ app.get('/quick-action/:id', requireLogin, (req, res) => {
 });
 
 
-// --- Inventory Management (Full CRUD) ---
-app.get('/inventory', requireLogin, (req,res) => {
-    db.all("SELECT i.*, l.name as location_name FROM items i LEFT JOIN locations l ON i.location_id = l.id ORDER BY i.name", (err, items) => {
-        if(err) { /* handle error */ }
+// --- Inventory Management ---
+
+app.get('/inventory', requireLogin, (req, res) => {
+    const { sortBy, order, showArchived } = req.query;
+    const validSorts = ['id', 'name', 'category', 'location_name', 'status'];
+    const validOrders = ['asc', 'desc'];
+
+    let orderBy = 'i.name';
+    let orderDirection = 'ASC';
+    let whereClause = showArchived ? "" : "WHERE i.status != 'Archived'";
+
+
+    if (validSorts.includes(sortBy) && validOrders.includes(order)) {
+        orderBy = `i.${sortBy}`;
+        if (sortBy === 'location_name') orderBy = `l.name`;
+        orderDirection = order.toUpperCase();
+    }
+
+    const sql = `SELECT i.*, l.name as location_name FROM items i LEFT JOIN locations l ON i.location_id = l.id ${whereClause} ORDER BY ${orderBy} ${orderDirection}`;
+
+    db.all(sql, (err, items) => {
+        const sortLink = (col, name) => {
+            const newOrder = sortBy === col && order === 'asc' ? 'desc' : 'asc';
+            const icon = sortBy === col ? (order === 'asc' ? '&#9650;' : '&#9660;') : '';
+            return `<a href="/inventory?sortBy=${col}&order=${newOrder}${showArchived ? '&showArchived=true' : ''}" class="hover:underline flex items-center gap-1">${name} ${icon}</a>`;
+        }
+
+        const renderStatusBadge = (item) => {
+            let statusText = '';
+            let statusColor = '';
+            if (item.status === 'Under Maintenance') {
+                statusText = 'Maintenance';
+                statusColor = 'bg-red-100 text-red-800';
+            } else if (item.status === 'Archived') {
+                statusText = 'Archived';
+                statusColor = 'bg-gray-200 text-gray-800';
+            } else if (item.is_consumable) {
+                statusText = `In Stock: ${item.quantity}`;
+                statusColor = 'bg-indigo-100 text-indigo-800';
+            } else if (item.quantity_checked_out >= item.quantity) {
+                statusText = 'Checked Out';
+                statusColor = 'bg-yellow-100 text-yellow-800';
+            } else if (item.quantity_checked_out > 0) {
+                statusText = `${item.quantity_checked_out} / ${item.quantity} Checked Out`;
+                statusColor = 'bg-blue-100 text-blue-800';
+            } else {
+                statusText = 'Available';
+                statusColor = 'bg-green-100 text-green-800';
+            }
+            return `<span class="font-semibold px-2 py-1 rounded-full text-xs ${statusColor}">${statusText}</span>`;
+        };
+
         const itemsHtml = items.map(item => `
             <tr class="border-b hover:bg-gray-50">
+                <td class="py-2 px-4"><input type="checkbox" name="itemIds" value="${item.id}" class="bulk-checkbox h-4 w-4 rounded border-gray-300 text-sky-600 focus:ring-sky-500"></td>
                 <td class="py-2 px-4">${item.id}</td>
-                <td class="py-2 px-4 font-semibold text-sky-700">${item.name}</td>
-                <td class="py-2 px-4">${item.category || 'N/A'}</td>
-                <td class="py-2 px-4">${item.location_name || 'N/A'}</td>
-                <td class="py-2 px-4">
-                     <span class="font-semibold px-2 py-1 rounded-full text-xs
-                        ${item.status === 'Available' ? 'bg-green-100 text-green-800' : ''}
-                        ${item.status === 'Checked Out' ? 'bg-yellow-100 text-yellow-800' : ''}
-                        ${item.status === 'Under Maintenance' ? 'bg-red-100 text-red-800' : ''}
-                    ">${item.status}</span>
-                </td>
-                <td class="py-2 px-4">
-                    <a href="/inventory/view/${item.id}" class="text-sky-600 hover:underline">Details</a>
-                </td>
+                <td class="py-2 px-4 font-semibold text-sky-700">${item.name} ${item.is_kit ? '<span class="text-xs bg-gray-200 px-1 py-0.5 rounded">Kit</span>' : ''} ${item.is_consumable ? '<span class="text-xs bg-indigo-200 px-1 py-0.5 rounded">Consumable</span>' : ''}</td>
+                <td class="py-2 px-4 hidden sm:table-cell">${item.category || 'N/A'}</td>
+                <td class="py-2 px-4 hidden lg:table-cell">${item.location_name || 'N/A'}</td>
+                <td class="py-2 px-4">${renderStatusBadge(item)}</td>
+                <td class="py-2 px-4"><a href="/inventory/view/${item.id}" class="text-sky-600 hover:underline">Details</a></td>
             </tr>
         `).join('');
-        const content = `
-        <div class="flex justify-between items-center mb-4">
-            <div></div>
-            <a href="/inventory/add" class="btn btn-primary">Add New Item</a>
-        </div>
-        <div class="card overflow-x-auto">
-            <table class="w-full text-left">
-                <thead><tr class="border-b-2">
-                    <th class="py-2 px-4">ID</th><th class="py-2 px-4">Name</th><th class="py-2 px-4">Category</th><th class="py-2 px-4">Location</th><th class="py-2 px-4">Status</th><th class="py-2 px-4">Actions</th>
-                </tr></thead>
-                <tbody>${itemsHtml}</tbody>
-            </table>
-        </div>
-        `;
-        res.send(renderPage(req, 'Inventory', req.session.user, content));
+
+        const itemsCardsHtml = items.map(item => `
+            <div class="card mb-4">
+                <div class="flex justify-between">
+                    <div class="font-bold text-lg text-sky-700">${item.name} ${item.is_kit ? '<span class="text-xs bg-gray-200 px-1 py-0.5 rounded">Kit</span>' : ''}</div>
+                    <input type="checkbox" name="itemIds" value="${item.id}" class="bulk-checkbox h-4 w-4 rounded border-gray-300 text-sky-600 focus:ring-sky-500">
+                </div>
+                <div class="text-sm text-gray-500 mb-2">ID: ${item.id}</div>
+                <div class="space-y-1 text-sm">
+                    <p><strong>Category:</strong> ${item.category || 'N/A'}</p>
+                    <p><strong>Location:</strong> ${item.location_name || 'N/A'}</p>
+                    <div class="flex items-center"><strong>Status:</strong>&nbsp; ${renderStatusBadge(item)}</div>
+                </div>
+                <div class="mt-4"><a href="/inventory/view/${item.id}" class="btn btn-primary w-full text-center">View Details</a></div>
+            </div>
+        `).join('');
+
+        db.all('SELECT * FROM locations', (err, locations) => {
+            const locationsOptions = locations.map(l => `<option value="${l.id}">${l.name}</option>`).join('');
+
+            const content = `
+            <div class="flex justify-between items-center mb-4">
+                <div class="flex items-center gap-4">
+                     <a href="/inventory/add" class="btn btn-primary">Add New Item</a>
+                     <div class="flex items-center gap-2">
+                        <input type="checkbox" id="showArchived" onchange="window.location.href = this.checked ? '/inventory?showArchived=true' : '/inventory'" ${showArchived ? 'checked' : ''}>
+                        <label for="showArchived">Show Archived</label>
+                     </div>
+                </div>
+            </div>
+            <form action="/inventory/bulk-edit" method="POST" id="bulk-edit-form">
+                <div class="card overflow-x-auto hidden md:block">
+                    <table class="w-full text-left">
+                        <thead><tr class="border-b-2">
+                            <th class="py-2 px-4"><input type="checkbox" id="select-all-checkbox"></th>
+                            <th class="py-2 px-4">${sortLink('id', 'ID')}</th>
+                            <th class="py-2 px-4">${sortLink('name', 'Name')}</th>
+                            <th class="py-2 px-4 hidden sm:table-cell">${sortLink('category', 'Category')}</th>
+                            <th class="py-2 px-4 hidden lg:table-cell">${sortLink('location_name', 'Location')}</th>
+                            <th class="py-2 px-4">${sortLink('status', 'Status')}</th>
+                            <th class="py-2 px-4">Actions</th>
+                        </tr></thead>
+                        <tbody>${itemsHtml}</tbody>
+                    </table>
+                </div>
+                <div class="md:hidden">${itemsCardsHtml}</div>
+
+                <div id="bulk-actions-bar" class="hidden sticky bottom-0 bg-gray-800 text-white p-4 mt-4 rounded-lg shadow-lg">
+                    <div class="flex flex-wrap items-center gap-4">
+                         <span id="items-selected-count" class="font-bold">0 items selected</span>
+                         <select name="bulk_action" class="p-2 rounded bg-gray-700 text-white">
+                            <option value="change_location">Change Location</option>
+                            <option value="change_category">Change Category</option>
+                            <option value="archive">Archive</option>
+                            <option value="unarchive">Un-Archive</option>
+                         </select>
+                         <select name="location_id" class="p-2 rounded bg-gray-700 text-white">${locationsOptions}</select>
+                         <input type="text" name="category" placeholder="New Category" class="p-2 rounded bg-gray-700 text-white">
+                         <button type="submit" class="btn btn-primary">Apply</button>
+                    </div>
+                </div>
+            </form>
+             <script>
+                const selectAll = document.getElementById('select-all-checkbox');
+                const checkboxes = document.querySelectorAll('.bulk-checkbox');
+                const bulkActionsBar = document.getElementById('bulk-actions-bar');
+                const selectedCount = document.getElementById('items-selected-count');
+
+                function toggleBulkActionsBar() {
+                    const checkedCount = document.querySelectorAll('.bulk-checkbox:checked').length;
+                    selectedCount.textContent = \`\${checkedCount} items selected\`;
+                    if (checkedCount > 0) {
+                        bulkActionsBar.classList.remove('hidden');
+                    } else {
+                        bulkActionsBar.classList.add('hidden');
+                    }
+                }
+                
+                selectAll.addEventListener('change', (e) => {
+                    checkboxes.forEach(cb => cb.checked = e.target.checked);
+                    toggleBulkActionsBar();
+                });
+
+                checkboxes.forEach(cb => {
+                    cb.addEventListener('change', toggleBulkActionsBar);
+                });
+            </script>
+            `;
+            res.send(renderPage(req, 'Inventory', req.session.user, content));
+        });
     });
 });
+
+app.post('/inventory/bulk-edit', requireRole(['admin', 'manager']), (req, res) => {
+    const { itemIds, bulk_action, location_id, category } = req.body;
+
+    if (!itemIds || itemIds.length === 0) {
+        req.session.error = "No items selected for bulk edit.";
+        return res.redirect('/inventory');
+    }
+    const ids = Array.isArray(itemIds) ? itemIds : [itemIds];
+    const placeholders = ids.map(() => '?').join(',');
+
+    let sql = '';
+    let params = [];
+    let actionText = '';
+
+    switch (bulk_action) {
+        case 'change_location':
+            sql = `UPDATE items SET location_id = ? WHERE id IN (${placeholders})`;
+            params = [location_id, ...ids];
+            actionText = 'Changed location';
+            break;
+        case 'change_category':
+            sql = `UPDATE items SET category = ? WHERE id IN (${placeholders})`;
+            params = [category, ...ids];
+            actionText = 'Changed category';
+            break;
+        case 'archive':
+            sql = `UPDATE items SET status = 'Archived' WHERE id IN (${placeholders})`;
+            params = ids;
+            actionText = 'Archived';
+            break;
+        case 'unarchive':
+            sql = `UPDATE items SET status = 'Available' WHERE id IN (${placeholders})`;
+            params = ids;
+            actionText = 'Un-archived';
+            break;
+        default:
+            req.session.error = "Invalid bulk action.";
+            return res.redirect('/inventory');
+    }
+
+    db.run(sql, params, function (err) {
+        if (err) {
+            req.session.error = `Bulk edit failed: ${err.message}`;
+        } else {
+            logAction(req.session.user, 'Bulk Edit Items', null, `${actionText} for ${this.changes} items.`, req.ip);
+            req.session.success = `Successfully updated ${this.changes} items.`;
+        }
+        res.redirect('/inventory');
+    });
+});
+
 
 app.get('/inventory/add', requireRole(['admin', 'manager']), (req, res) => {
     db.all('SELECT * FROM locations', (err, locations) => {
@@ -708,142 +1027,266 @@ app.get('/inventory/add', requireRole(['admin', 'manager']), (req, res) => {
                         <div><label class="block">Name*</label><input type="text" name="name" class="w-full p-2 border rounded" required></div>
                         <div><label class="block">Category</label><input type="text" name="category" class="w-full p-2 border rounded"></div>
                         <div><label class="block">Model Number</label><input type="text" name="model_number" class="w-full p-2 border rounded"></div>
-                        <div><label class="block">Serial Number</label><input type="text" name="serial_number" class="w-full p-2 border rounded"></div>
+                        <div><label class="block">Serial Number (optional)</label><input type="text" name="serial_number" class="w-full p-2 border rounded"></div>
                         <div><label class="block">Manufacturer/Supplier</label><input type="text" name="manufacturer" class="w-full p-2 border rounded"></div>
                         <div><label class="block">Condition</label><input type="text" name="condition" class="w-full p-2 border rounded"></div>
                         <div><label class="block">Location</label><select name="location_id" class="w-full p-2 border rounded">${locationsOptions}</select></div>
-                        <div><label class="block">Quantity</label><input type="number" name="quantity" value="1" class="w-full p-2 border rounded"></div>
+                        <div><label class="block">Quantity</label><input type="number" name="quantity" value="1" min="1" class="w-full p-2 border rounded"></div>
                         <div class="md:col-span-2"><label class="block">Specifications</label><textarea name="specifications" class="w-full p-2 border rounded"></textarea></div>
                         <div class="md:col-span-2"><label class="block">Comment</label><textarea name="comment" class="w-full p-2 border rounded"></textarea></div>
                         <div><label class="block">Image</label><input type="file" name="itemImage" class="w-full p-2 border rounded"></div>
+                        <div class="md:col-span-2 grid grid-cols-1 sm:grid-cols-2 gap-4">
+                            <div class="flex items-start gap-2 p-3 rounded-lg border">
+                               <input type="checkbox" name="is_kit" id="is_kit" value="1" class="h-4 w-4 mt-1 rounded border-gray-300 text-sky-600 focus:ring-sky-500">
+                               <div>
+                                  <label for="is_kit" class="font-semibold">This item is a kit</label>
+                                  <p class="text-sm text-gray-500">It contains other inventory items.</p>
+                               </div>
+                            </div>
+                            <div class="flex items-start gap-2 p-3 rounded-lg border">
+                               <input type="checkbox" name="is_consumable" id="is_consumable" value="1" class="h-4 w-4 mt-1 rounded border-gray-300 text-sky-600 focus:ring-sky-500">
+                               <div>
+                                  <label for="is_consumable" class="font-semibold">This item is a consumable</label>
+                                  <p class="text-sm text-gray-500">Its quantity is used up, not checked out.</p>
+                               </div>
+                            </div>
+                        </div>
+                        <div id="consumable_options" class="hidden">
+                           <label class="block">Low Stock Alert Threshold</label>
+                           <input type="number" name="low_stock_threshold" placeholder="e.g., 10" class="w-full p-2 border rounded">
+                        </div>
                     </div>
                     <div class="mt-6"><button type="submit" class="btn btn-primary">Add Item</button></div>
                 </form>
             </div>
+            <script>
+                document.getElementById('is_consumable').addEventListener('change', function() {
+                    document.getElementById('consumable_options').classList.toggle('hidden', !this.checked);
+                });
+            </script>
         `;
         res.send(renderPage(req, 'Add New Item', req.session.user, content));
     });
 });
 
 app.post('/inventory/add', requireRole(['admin', 'manager']), upload.single('itemImage'), (req, res) => {
-    const { name, quantity, model_number, serial_number, manufacturer, category, condition, specifications, location_id, comment } = req.body;
+    const { name, quantity, model_number, serial_number, manufacturer, category, condition, specifications, location_id, comment, low_stock_threshold } = req.body;
+    const is_kit = req.body.is_kit ? 1 : 0;
+    const is_consumable = req.body.is_consumable ? 1 : 0;
+
+    const finalSerialNumber = serial_number && serial_number.trim() !== '' ? serial_number.trim() : `MBSH-${Date.now()}`;
+
     const imageUrl = req.file ? `/uploads/images/${req.file.filename}` : null;
-    
-    const sql = `INSERT INTO items (name, quantity, model_number, serial_number, manufacturer, category, condition, specifications, location_id, comment, image_url, last_activity_date)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`;
-    
-    db.run(sql, [name, quantity, model_number, serial_number, manufacturer, category, condition, specifications, location_id, comment, imageUrl], function(err) {
+
+    const sql = `INSERT INTO items (name, quantity, model_number, serial_number, manufacturer, category, condition, specifications, location_id, comment, image_url, is_kit, is_consumable, low_stock_threshold, last_activity_date)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`;
+
+    db.run(sql, [name, quantity, model_number, finalSerialNumber, manufacturer, category, condition, specifications, location_id, comment, imageUrl, is_kit, is_consumable, low_stock_threshold], function (err) {
         if (err) {
             req.session.error = `Failed to add item. Serial number might already exist. Error: ${err.message}`;
             res.redirect('/inventory/add');
         } else {
-            const newItem = { id: this.lastID, name: name };
+            const newItemId = this.lastID;
+            const newItem = { id: newItemId, name: name };
             logAction(req.session.user, 'Created Item', newItem, '', req.ip);
             req.session.success = "Item added successfully.";
-            res.redirect('/inventory');
+            if (is_kit) {
+                res.redirect(`/inventory/edit/${newItemId}`);
+            } else {
+                res.redirect('/inventory');
+            }
         }
     });
 });
 
 app.get('/inventory/view/:id', requireLogin, async (req, res) => {
     const itemId = req.params.id;
-    db.get(`SELECT i.*, l.name as location_name, u.name as checked_out_by_name 
-            FROM items i 
-            LEFT JOIN locations l ON i.location_id = l.id
-            LEFT JOIN users u ON i.checked_out_by_id = u.id
-            WHERE i.id = ?`, [itemId], async (err, item) => {
-        if(err || !item) {
+    db.get(`SELECT i.*, l.name as location_name FROM items i LEFT JOIN locations l ON i.location_id = l.id WHERE i.id = ?`, [itemId], async (err, item) => {
+        if (err || !item) {
             req.session.error = "Item not found.";
             return res.redirect('/inventory');
         }
-        
-        db.all('SELECT ml.*, u.name as reporter_name FROM maintenance_log ml JOIN users u ON ml.user_id = u.id WHERE item_id = ? ORDER BY report_date DESC', [itemId], async (err, maintenance_logs) => {
 
-            const qrCodeUrl = await QRCode.toDataURL(`${req.protocol}://${req.get('host')}/quick-action/${itemId}`);
+        db.all('SELECT ml.*, u.name as reporter_name FROM maintenance_log ml LEFT JOIN users u ON ml.user_id = u.id WHERE item_id = ? ORDER BY report_date DESC', [itemId], (err, maintenance_logs) => {
+            db.all('SELECT i.id, i.name FROM items i JOIN kits k ON i.id = k.item_id WHERE k.kit_id = ?', [itemId], async (err, kit_components) => {
+                db.all(`SELECT i.id, i.name FROM items i JOIN related_items ri ON i.id = ri.item_b_id WHERE ri.item_a_id = ? 
+                        UNION 
+                        SELECT i.id, i.name FROM items i JOIN related_items ri ON i.id = ri.item_a_id WHERE ri.item_b_id = ?`, [itemId, itemId], async (err, related_items) => {
 
-            let adminActions = '';
-            if(req.session.user.role !== 'user') {
-                adminActions = `<div class="flex gap-2"><a href="/inventory/edit/${item.id}" class="btn btn-secondary">Edit Item</a>
-                <form action="/inventory/delete/${item.id}" method="POST" onsubmit="return confirm('Are you sure you want to permanently delete this item?');">
-                    <button type="submit" class="btn btn-danger">Delete</button>
-                </form></div>`;
-            }
-            
-            let actionBox = '';
-            if (item.status === 'Available') {
-                actionBox = `<form action="/inventory/checkout/${item.id}" method="POST"><button type="submit" class="btn btn-primary w-full">Check Out</button></form>`;
-            } else if (item.status === 'Checked Out') {
-                actionBox = `<form action="/inventory/checkin/${item.id}" method="POST"><button type="submit" class="btn btn-secondary w-full">Check In</button></form>`;
-            }
-            
-            let maintenanceBox = `<div class="mt-4">
-                <h4 class="font-bold">Report an Issue</h4>
-                <form action="/maintenance/report/${item.id}" method="POST">
-                    <textarea name="description" class="w-full p-2 border rounded" placeholder="Describe the issue..." required></textarea>
-                    <button type="submit" class="btn btn-danger w-full mt-2">Submit Report</button>
-                </form>
-            </div>`;
+                    const qrCodeUrl = await QRCode.toDataURL(`${req.protocol}://${req.get('host')}/quick-action/${itemId}`);
 
-            const maintenanceHistory = maintenance_logs.length > 0 ? `
-                <div class="mt-4 pt-4 border-t">
-                    <h3 class="font-bold">Maintenance History</h3>
-                    <ul class="divide-y">${maintenance_logs.map(log => `
-                        <li class="py-2">
-                            <p><strong>${log.description}</strong> - Reported by ${log.reporter_name}</p>
-                            <p class="text-sm text-gray-500">${new Date(log.report_date).toLocaleString()}</p>
-                            ${log.resolved_date ? `<p class="text-sm text-green-600">Resolved: ${log.resolution_notes}</p>` : ''}
-                        </li>
-                    `).join('')}</ul>
-                </div>` : '';
+                    const openMaintenanceLog = maintenance_logs.find(log => !log.resolved_date);
 
+                    let adminActions = '';
+                    if (req.session.user.role !== 'user') {
+                        adminActions = `<div class="flex gap-2">
+                        <a href="/inventory/edit/${item.id}" class="btn btn-secondary">Edit</a>
+                        ${item.status !== 'Archived' ? `<form action="/inventory/archive/${item.id}" method="POST" onsubmit="return confirm('Are you sure you want to archive this item?');">
+                            <button type="submit" class="btn btn-warning">Archive</button>
+                        </form>` : `<form action="/inventory/unarchive/${item.id}" method="POST">
+                            <button type="submit" class="btn btn-primary">Un-Archive</button>
+                        </form>`}
+                        </div>`;
+                    }
 
-            const content = `
-                <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
-                    <div class="lg:col-span-2">
-                        <div class="card">
-                            <div class="flex justify-between items-start">
-                                 <h2 class="text-2xl font-bold">${item.name}</h2>
-                                 ${adminActions}
+                    let actionBox = '';
+                    if (item.status === 'Under Maintenance' && req.session.user.role !== 'user' && openMaintenanceLog) {
+                        actionBox = `
+                            <div class="bg-yellow-50 p-4 rounded-lg">
+                                <h4 class="font-bold text-yellow-800">Resolve Maintenance Issue</h4>
+                                <p class="text-sm text-gray-600 mb-2"><strong>Issue:</strong> ${openMaintenanceLog.description}</p>
+                                <form action="/maintenance/resolve/${openMaintenanceLog.id}" method="POST">
+                                    <textarea name="resolution_notes" class="w-full p-2 border rounded" placeholder="Enter resolution notes..." required></textarea>
+                                    <button type="submit" class="btn btn-primary w-full mt-2">Mark as Resolved</button>
+                                </form>
                             </div>
-                            <p class="text-gray-500 mb-4">Category: ${item.category || 'N/A'}</p>
-                            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-                                <p><strong>Status:</strong> <span class="font-semibold px-2 py-1 rounded-full text-sm
-                                    ${item.status === 'Available' ? 'bg-green-100 text-green-800' : ''}
-                                    ${item.status === 'Checked Out' ? 'bg-yellow-100 text-yellow-800' : ''}
-                                    ${item.status === 'Under Maintenance' ? 'bg-red-100 text-red-800' : ''}
-                                ">${item.status}</span></p>
-                                ${item.status === 'Checked Out' ? `<p><strong>Checked out by:</strong> ${item.checked_out_by_name}</p>` : ''}
-                                <p><strong>Model:</strong> ${item.model_number || 'N/A'}</p>
-                                <p><strong>Serial:</strong> ${item.serial_number || 'N/A'}</p>
-                                <p><strong>Location:</strong> ${item.location_name || 'N/A'}</p>
-                                <p><strong>Manufacturer:</strong> ${item.manufacturer || 'N/A'}</p>
-                            </div>
-                            <div class="mt-4 pt-4 border-t">
-                                 <h3 class="font-bold">Specifications</h3>
-                                 <p class="text-gray-700 whitespace-pre-wrap">${item.specifications || 'None'}</p>
-                            </div>
-                             <div class="mt-4 pt-4 border-t">
-                                 <h3 class="font-bold">Comments</h3>
-                                 <p class="text-gray-700 whitespace-pre-wrap">${item.comment || 'None'}</p>
-                            </div>
-                            ${maintenanceHistory}
+                        `;
+                    } else if (item.status !== 'Archived' && item.status !== 'Under Maintenance') {
+                        if (item.is_consumable) {
+                            actionBox = `
+                                <form action="/inventory/use/${item.id}" method="POST">
+                                    <div class="mb-2">
+                                        <label class="block font-semibold">Use Quantity</label>
+                                        <input type="number" name="quantity_used" value="1" min="1" max="${item.quantity}" class="w-full p-2 border rounded" required>
+                                    </div>
+                                    <button type="submit" class="btn btn-primary w-full">Confirm Use</button>
+                                </form>
+                            `;
+                        } else {
+                            if (item.quantity_checked_out < item.quantity) {
+                                actionBox += `<form action="/inventory/checkout/${item.id}" method="POST"><button type="submit" class="btn btn-primary w-full mb-2">Check Out</button></form>`;
+                            }
+                            if (item.quantity_checked_out > 0) {
+                                actionBox += `<form action="/inventory/checkin/${item.id}" method="POST"><button type="submit" class="btn btn-secondary w-full">Check In</button></form>`;
+                            }
+                        }
+                    }
+
+
+                    if (actionBox === '') {
+                        actionBox = `<p class="text-center text-gray-500">No actions available.</p>`;
+                    }
+
+                    let maintenanceBox = `<div class="mt-4">
+                        <h4 class="font-bold">Report an Issue</h4>
+                        <form action="/maintenance/report/${item.id}" method="POST">
+                            <textarea name="description" class="w-full p-2 border rounded" placeholder="Describe the issue..." required></textarea>
+                            <button type="submit" class="btn btn-warning w-full mt-2">Submit Report</button>
+                        </form>
+                    </div>`;
+
+                    const maintenanceHistory = maintenance_logs.length > 0 ? `
+                        <div class="mt-4 pt-4 border-t">
+                            <h3 class="font-bold">Maintenance History</h3>
+                            <ul class="divide-y">${maintenance_logs.map(log => `
+                                <li class="py-2">
+                                    <p><strong>${log.description}</strong> - Reported by ${log.reporter_name || 'Deleted User'}</p>
+                                    <p class="text-sm text-gray-500">${new Date(log.report_date).toLocaleString()}</p>
+                                    ${log.resolved_date
+                            ? `<p class="text-sm text-green-700 bg-green-100 p-2 rounded-md mt-1"><strong>Resolved:</strong> ${log.resolution_notes || 'Issue marked as resolved.'}</p>`
+                            : '<p class="text-sm text-red-700"><strong>Status:</strong> Unresolved</p>'}
+                                </li>
+                            `).join('')}</ul>
+                        </div>` : '';
+
+                    let kitDetailsHtml = '';
+                    if (item.is_kit) {
+                        kitDetailsHtml = `
+                        <div class="mt-4 pt-4 border-t">
+                            <h3 class="font-bold">Kit Components</h3>
+                            ${kit_components.length > 0 ? `
+                            <ul class="list-disc list-inside mt-2">
+                                ${kit_components.map(c => `<li><a href="/inventory/view/${c.id}" class="text-sky-600 hover:underline">${c.name}</a></li>`).join('')}
+                            </ul>
+                            ` : '<p class="text-gray-600 mt-2">No components assigned. You can add them in the edit screen.</p>'}
                         </div>
-                    </div>
-                    <div>
-                        <div class="card text-center">
-                            <h3 class="font-bold mb-2">Item QR Code</h3>
-                             <img src="${qrCodeUrl}" alt="QR Code" class="mx-auto max-w-full h-auto">
-                            <a href="/qr/${item.id}" target="_blank" class="text-sm text-sky-600 hover:underline mt-2 inline-block">Open in new tab</a>
+                        `;
+                    }
+                    let relatedItemsHtml = `
+                        <div class="mt-4 pt-4 border-t">
+                            <h3 class="font-bold">Related Items</h3>
+                            ${related_items.length > 0 ? `
+                            <ul class="list-disc list-inside mt-2">
+                                ${related_items.map(c => `<li><a href="/inventory/view/${c.id}" class="text-sky-600 hover:underline">${c.name}</a></li>`).join('')}
+                            </ul>
+                            ` : '<p class="text-gray-600 mt-2">No related items assigned. You can add them in the edit screen.</p>'}
                         </div>
-                         <div class="card mt-6">
-                             <h3 class="font-bold mb-2">Actions</h3>
-                             ${actionBox}
-                             ${maintenanceBox}
-                         </div>
-                    </div>
-                </div>
-            `;
-            res.send(renderPage(req, item.name, req.session.user, content));
+                        `;
+
+
+                    const renderStatusBadge = (item) => {
+                        let statusText = '';
+                        let statusColor = '';
+                        if (item.status === 'Under Maintenance') {
+                            statusText = 'Maintenance';
+                            statusColor = 'bg-red-100 text-red-800';
+                        } else if (item.status === 'Archived') {
+                            statusText = 'Archived';
+                            statusColor = 'bg-gray-200 text-gray-800';
+                        } else if (item.is_consumable) {
+                            statusText = `In Stock: ${item.quantity}`;
+                            statusColor = 'bg-indigo-100 text-indigo-800';
+                        } else if (item.quantity_checked_out >= item.quantity) {
+                            statusText = 'Checked Out';
+                            statusColor = 'bg-yellow-100 text-yellow-800';
+                        } else if (item.quantity_checked_out > 0) {
+                            statusText = `${item.quantity_checked_out} / ${item.quantity} Checked Out`;
+                            statusColor = 'bg-blue-100 text-blue-800';
+                        } else {
+                            statusText = 'Available';
+                            statusColor = 'bg-green-100 text-green-800';
+                        }
+                        return `<span class="font-semibold px-2 py-1 rounded-full text-xs ${statusColor}">${statusText}</span>`;
+                    };
+
+
+                    const content = `
+                        <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                            <div class="lg:col-span-2">
+                                <div class="card">
+                                    <div class="flex flex-col sm:flex-row justify-between sm:items-start gap-4">
+                                        <h2 class="text-2xl font-bold">${item.name}</h2>
+                                        ${adminActions}
+                                    </div>
+                                    <p class="text-gray-500 mb-4">Category: ${item.category || 'N/A'}</p>
+                                    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                        <div><strong>Status:</strong> ${renderStatusBadge(item)}</div>
+                                        <p><strong>Model:</strong> ${item.model_number || 'N/A'}</p>
+                                        <p><strong>Serial:</strong> ${item.serial_number || 'N/A'}</p>
+                                        <p><strong>Location:</strong> ${item.location_name || 'N/A'}</p>
+                                        <p><strong>Manufacturer:</strong> ${item.manufacturer || 'N/A'}</p>
+                                        <p><strong>Quantity:</strong> ${item.quantity}</p>
+                                    </div>
+                                    <div class="mt-4 pt-4 border-t">
+                                        <h3 class="font-bold">Specifications</h3>
+                                        <p class="text-gray-700 whitespace-pre-wrap">${item.specifications || 'None'}</p>
+                                    </div>
+                                    <div class="mt-4 pt-4 border-t">
+                                        <h3 class="font-bold">Comments</h3>
+                                        <p class="text-gray-700 whitespace-pre-wrap">${item.comment || 'None'}</p>
+                                    </div>
+                                    ${kitDetailsHtml}
+                                    ${relatedItemsHtml}
+                                    ${maintenanceHistory}
+                                </div>
+                            </div>
+                            <div>
+                                <div class="card text-center">
+                                    <h3 class="font-bold mb-2">Item QR Code</h3>
+                                    <img src="${qrCodeUrl}" alt="QR Code" class="mx-auto max-w-full h-auto">
+                                    <a href="/qr/${item.id}" target="_blank" class="text-sm text-sky-600 hover:underline mt-2 inline-block">Open in new tab</a>
+                                </div>
+                                <div class="card mt-6">
+                                    <h3 class="font-bold mb-2">Actions</h3>
+                                    ${actionBox}
+                                    ${item.status !== 'Under Maintenance' && item.status !== 'Archived' ? maintenanceBox : ''}
+                                </div>
+                            </div>
+                        </div>
+                    `;
+                    res.send(renderPage(req, item.name, req.session.user, content));
+                });
+            });
         });
     });
 });
@@ -851,45 +1294,153 @@ app.get('/inventory/view/:id', requireLogin, async (req, res) => {
 app.get('/inventory/edit/:id', requireRole(['admin', 'manager']), (req, res) => {
     const itemId = req.params.id;
     db.get('SELECT * FROM items WHERE id = ?', [itemId], (err, item) => {
-        if(err || !item) {
+        if (err || !item) {
             req.session.error = "Item not found.";
             return res.redirect('/inventory');
         }
         db.all('SELECT * FROM locations', (err, locations) => {
-            const locationsOptions = locations.map(l => `<option value="${l.id}" ${item.location_id === l.id ? 'selected' : ''}>${l.name}</option>`).join('');
-            const content = `
-                <div class="card max-w-4xl mx-auto">
-                    <form action="/inventory/edit/${itemId}" method="POST" enctype="multipart/form-data">
-                        <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
-                            <div><label class="block">Name*</label><input type="text" name="name" value="${item.name}" class="w-full p-2 border rounded" required></div>
-                            <div><label class="block">Category</label><input type="text" name="category" value="${item.category || ''}" class="w-full p-2 border rounded"></div>
-                            <div><label class="block">Model Number</label><input type="text" name="model_number" value="${item.model_number || ''}" class="w-full p-2 border rounded"></div>
-                            <div><label class="block">Serial Number</label><input type="text" name="serial_number" value="${item.serial_number || ''}" class="w-full p-2 border rounded"></div>
-                            <div><label class="block">Manufacturer/Supplier</label><input type="text" name="manufacturer" value="${item.manufacturer || ''}" class="w-full p-2 border rounded"></div>
-                            <div><label class="block">Condition</label><input type="text" name="condition" value="${item.condition || ''}" class="w-full p-2 border rounded"></div>
-                            <div><label class="block">Location</label><select name="location_id" class="w-full p-2 border rounded">${locationsOptions}</select></div>
-                            <div><label class="block">Quantity</label><input type="number" name="quantity" value="${item.quantity}" class="w-full p-2 border rounded"></div>
-                            <div class="md:col-span-2"><label class="block">Specifications</label><textarea name="specifications" class="w-full p-2 border rounded">${item.specifications || ''}</textarea></div>
-                            <div class="md:col-span-2"><label class="block">Comment</label><textarea name="comment" class="w-full p-2 border rounded">${item.comment || ''}</textarea></div>
-                            <div>
-                                <label class="block">Image</label>
-                                <input type="file" name="itemImage" class="w-full p-2 border rounded">
-                                <p class="text-sm text-gray-500">Current: <a href="${item.image_url || '#'}" class="text-sky-600">${item.image_url ? 'View Image' : 'None'}</a></p>
+            db.all('SELECT id, name FROM items WHERE id != ? AND is_kit = 0 AND status != "Archived" ORDER BY name', [itemId], (err, all_items) => {
+                db.all('SELECT i.id, i.name FROM items i JOIN kits k ON i.id = k.item_id WHERE k.kit_id = ?', [itemId], (err, kit_components) => {
+                    db.all(`SELECT i.id, i.name FROM items i JOIN related_items ri ON i.id = ri.item_b_id WHERE ri.item_a_id = ? 
+                        UNION 
+                        SELECT i.id, i.name FROM items i JOIN related_items ri ON i.id = ri.item_a_id WHERE ri.item_b_id = ?`, [itemId, itemId], (err, related_items) => {
+
+
+                        const locationsOptions = locations.map(l => `<option value="${l.id}" ${item.location_id === l.id ? 'selected' : ''}>${l.name}</option>`).join('');
+
+                        const componentIds = kit_components.map(c => c.id);
+                        const availableItemsForKit = all_items.filter(i => !componentIds.includes(i.id));
+                        const allItemsOptions = availableItemsForKit.map(i => `<option value="${i.id}">${i.name}</option>`).join('');
+
+                        const relatedIds = related_items.map(r => r.id);
+                        const availableForRelation = all_items.filter(i => !relatedIds.includes(i.id));
+                        const relationOptions = availableForRelation.map(i => `<option value="${i.id}">${i.name}</option>`).join('');
+
+                        let kitManagementHtml = '';
+                        if (item.is_kit) {
+                            kitManagementHtml = `
+                            <div class="md:col-span-2 pt-6 mt-6 border-t">
+                                <h3 class="text-xl font-bold mb-4">Manage Kit Components</h3>
+                                <div class="card bg-gray-50">
+                                    <h4 class="font-bold mb-2">Current Components</h4>
+                                    ${kit_components.length > 0 ? `
+                                    <ul class="mb-4 space-y-2">
+                                        ${kit_components.map(c => `
+                                        <li class="flex justify-between items-center p-2 bg-white rounded shadow-sm">
+                                            <span>${c.name}</span>
+                                            <form action="/inventory/kit/remove/${item.id}/${c.id}" method="POST" onsubmit="return confirm('Remove this component?')">
+                                                <button type="submit" class="text-red-500 hover:underline text-sm font-semibold">Remove</button>
+                                            </form>
+                                        </li>`).join('')}
+                                    </ul>
+                                    ` : '<p class="text-gray-600 mb-4">No components assigned yet.</p>'}
+                                    
+                                    <h4 class="font-bold mb-2">Add New Component</h4>
+                                    <form action="/inventory/kit/add/${item.id}" method="POST" class="flex flex-col sm:flex-row gap-2">
+                                        <select name="item_id" class="flex-grow p-2 border rounded">
+                                            ${allItemsOptions.length > 0 ? allItemsOptions : '<option disabled>No other items available</option>'}
+                                        </select>
+                                        <button type="submit" class="btn btn-secondary">Add</button>
+                                    </form>
+                                </div>
                             </div>
-                        </div>
-                        <div class="mt-6"><button type="submit" class="btn btn-primary">Save Changes</button></div>
-                    </form>
-                </div>
-            `;
-            res.send(renderPage(req, `Edit: ${item.name}`, req.session.user, content));
+                            `;
+                        }
+
+                        const content = `
+                            <div class="card max-w-4xl mx-auto">
+                                <form action="/inventory/edit/${itemId}" method="POST" enctype="multipart/form-data">
+                                    <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                                        <div><label class="block">Name*</label><input type="text" name="name" value="${item.name}" class="w-full p-2 border rounded" required></div>
+                                        <div><label class="block">Category</label><input type="text" name="category" value="${item.category || ''}" class="w-full p-2 border rounded"></div>
+                                        <div><label class="block">Model Number</label><input type="text" name="model_number" value="${item.model_number || ''}" class="w-full p-2 border rounded"></div>
+                                        <div><label class="block">Serial Number</label><input type="text" name="serial_number" value="${item.serial_number || ''}" class="w-full p-2 border rounded"></div>
+                                        <div><label class="block">Manufacturer/Supplier</label><input type="text" name="manufacturer" value="${item.manufacturer || ''}" class="w-full p-2 border rounded"></div>
+                                        <div><label class="block">Condition</label><input type="text" name="condition" value="${item.condition || ''}" class="w-full p-2 border rounded"></div>
+                                        <div><label class="block">Location</label><select name="location_id" class="w-full p-2 border rounded">${locationsOptions}</select></div>
+                                        <div><label class="block">Total Quantity</label><input type="number" name="quantity" value="${item.quantity}" min="1" class="w-full p-2 border rounded"></div>
+                                        <div class="md:col-span-2"><label class="block">Specifications</label><textarea name="specifications" class="w-full p-2 border rounded">${item.specifications || ''}</textarea></div>
+                                        <div class="md:col-span-2"><label class="block">Comment</label><textarea name="comment" class="w-full p-2 border rounded">${item.comment || ''}</textarea></div>
+                                        <div>
+                                            <label class="block">Image</label>
+                                            <input type="file" name="itemImage" class="w-full p-2 border rounded">
+                                            <p class="text-sm text-gray-500">Current: <a href="${item.image_url || '#'}" class="text-sky-600">${item.image_url ? 'View Image' : 'None'}</a></p>
+                                        </div>
+                                         <div class="md:col-span-2 grid grid-cols-1 sm:grid-cols-2 gap-4">
+                                            <div class="flex items-start gap-2 p-3 rounded-lg border">
+                                                <input type="checkbox" name="is_kit" id="is_kit" value="1" ${item.is_kit ? 'checked' : ''} class="h-4 w-4 mt-1 rounded border-gray-300 text-sky-600 focus:ring-sky-500">
+                                                <div>
+                                                    <label for="is_kit" class="font-semibold">This item is a kit</label>
+                                                    <p class="text-sm text-gray-500">It contains other inventory items.</p>
+                                                </div>
+                                            </div>
+                                            <div class="flex items-start gap-2 p-3 rounded-lg border">
+                                                <input type="checkbox" name="is_consumable" id="is_consumable" value="1" ${item.is_consumable ? 'checked' : ''} class="h-4 w-4 mt-1 rounded border-gray-300 text-sky-600 focus:ring-sky-500">
+                                                <div>
+                                                    <label for="is_consumable" class="font-semibold">This item is a consumable</label>
+                                                    <p class="text-sm text-gray-500">Its quantity is used up, not checked out.</p>
+                                                </div>
+                                            </div>
+                                        </div>
+                                         <div id="consumable_options" class="${item.is_consumable ? '' : 'hidden'}">
+                                            <label class="block">Low Stock Alert Threshold</label>
+                                            <input type="number" name="low_stock_threshold" placeholder="e.g., 10" class="w-full p-2 border rounded" value="${item.low_stock_threshold || ''}">
+                                        </div>
+                                        ${kitManagementHtml}
+                                         <div class="md:col-span-2 pt-6 mt-6 border-t">
+                                            <h3 class="text-xl font-bold mb-4">Manage Related Items</h3>
+                                            <div class="card bg-gray-50">
+                                                <h4 class="font-bold mb-2">Currently Related Items</h4>
+                                                 ${related_items.length > 0 ? `
+                                                    <ul class="mb-4 space-y-2">
+                                                        ${related_items.map(r => `
+                                                        <li class="flex justify-between items-center p-2 bg-white rounded shadow-sm">
+                                                            <span>${r.name}</span>
+                                                            <form action="/inventory/related/remove/${item.id}/${r.id}" method="POST" onsubmit="return confirm('Remove this relation?')">
+                                                                <button type="submit" class="text-red-500 hover:underline text-sm font-semibold">Remove</button>
+                                                            </form>
+                                                        </li>`).join('')}
+                                                    </ul>
+                                                ` : '<p class="text-gray-600 mb-4">No related items assigned yet.</p>'}
+                                                
+                                                <h4 class="font-bold mb-2">Add New Relation</h4>
+                                                <form action="/inventory/related/add/${item.id}" method="POST" class="flex flex-col sm:flex-row gap-2">
+                                                    <select name="related_item_id" class="flex-grow p-2 border rounded">
+                                                        ${relationOptions.length > 0 ? relationOptions : '<option disabled>No other items available</option>'}
+                                                    </select>
+                                                    <button type="submit" class="btn btn-secondary">Add</button>
+                                                </form>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <div class="mt-6 flex justify-between">
+                                        <button type="submit" class="btn btn-primary">Save Changes</button>
+                                         <a href="#" onclick="if(confirm('Are you sure you want to permanently delete this item? This action CANNOT be undone.')) { document.getElementById('delete-form').submit(); }" class="btn btn-danger">Delete Permanently</a>
+                                    </div>
+                                </form>
+                                 <form id="delete-form" action="/inventory/delete/${item.id}" method="POST" class="hidden"></form>
+                            </div>
+                             <script>
+                                document.getElementById('is_consumable').addEventListener('change', function() {
+                                    document.getElementById('consumable_options').classList.toggle('hidden', !this.checked);
+                                });
+                            </script>
+                        `;
+                        res.send(renderPage(req, `Edit: ${item.name}`, req.session.user, content));
+                    });
+                });
+            });
         });
     });
 });
 
 app.post('/inventory/edit/:id', requireRole(['admin', 'manager']), upload.single('itemImage'), (req, res) => {
     const itemId = req.params.id;
-    const { name, quantity, model_number, serial_number, manufacturer, category, condition, specifications, location_id, comment } = req.body;
-    
+    const { name, quantity, model_number, serial_number, manufacturer, category, condition, specifications, location_id, comment, low_stock_threshold } = req.body;
+    const is_kit = req.body.is_kit ? 1 : 0;
+    const is_consumable = req.body.is_consumable ? 1 : 0;
+    const finalSerialNumber = serial_number && serial_number.trim() !== '' ? serial_number.trim() : null;
+
     let imageUrlSql = '';
     let imageUrlParams = [];
     if (req.file) {
@@ -899,32 +1450,64 @@ app.post('/inventory/edit/:id', requireRole(['admin', 'manager']), upload.single
 
     const sql = `UPDATE items SET 
         name = ?, quantity = ?, model_number = ?, serial_number = ?, manufacturer = ?, 
-        category = ?, condition = ?, specifications = ?, location_id = ?, comment = ?
+        category = ?, condition = ?, specifications = ?, location_id = ?, comment = ?, is_kit = ?,
+        is_consumable = ?, low_stock_threshold = ?
         ${imageUrlSql} 
         WHERE id = ?`;
-    
-    const params = [name, quantity, model_number, serial_number, manufacturer, category, condition, specifications, location_id, comment, ...imageUrlParams, itemId];
 
-    db.run(sql, params, function(err) {
+    const params = [name, quantity, model_number, finalSerialNumber, manufacturer, category, condition, specifications, location_id, comment, is_kit, is_consumable, low_stock_threshold, ...imageUrlParams, itemId];
+
+    db.run(sql, params, function (err) {
         if (err) {
             req.session.error = `Failed to update item. Error: ${err.message}`;
-            res.redirect(`/inventory/edit/${itemId}`);
         } else {
+            if (!is_kit) {
+                // If it's no longer a kit, remove all component associations
+                db.run('DELETE FROM kits WHERE kit_id = ?', [itemId]);
+            }
             logAction(req.session.user, 'Updated Item', { id: itemId, name: name }, '', req.ip);
             req.session.success = "Item updated successfully.";
-            res.redirect(`/inventory/view/${itemId}`);
         }
+        res.redirect(`/inventory/view/${itemId}`);
     });
 });
+
+app.post('/inventory/archive/:id', requireRole(['admin', 'manager']), (req, res) => {
+    const itemId = req.params.id;
+    db.run("UPDATE items SET status = 'Archived' WHERE id = ?", [itemId], function (err) {
+        if (err) {
+            req.session.error = "Failed to archive item.";
+        } else {
+            logAction(req.session.user, 'Archived Item', { id: itemId }, '', req.ip);
+            req.session.success = "Item archived successfully.";
+        }
+        res.redirect(req.get('referer') || `/inventory/view/${itemId}`);
+    });
+});
+
+app.post('/inventory/unarchive/:id', requireRole(['admin', 'manager']), (req, res) => {
+    const itemId = req.params.id;
+    // When un-archiving, set to available. User can change it later if needed.
+    db.run("UPDATE items SET status = 'Available' WHERE id = ?", [itemId], function (err) {
+        if (err) {
+            req.session.error = "Failed to un-archive item.";
+        } else {
+            logAction(req.session.user, 'Un-Archived Item', { id: itemId }, '', req.ip);
+            req.session.success = "Item restored successfully.";
+        }
+        res.redirect(req.get('referer') || `/inventory/view/${itemId}`);
+    });
+});
+
 
 app.post('/inventory/delete/:id', requireRole(['admin']), (req, res) => {
     const itemId = req.params.id;
     db.get('SELECT name, image_url FROM items WHERE id = ?', [itemId], (err, item) => {
-         if (err || !item) {
+        if (err || !item) {
             req.session.error = "Item not found.";
             return res.redirect('/inventory');
         }
-        db.run('DELETE FROM items WHERE id = ?', [itemId], function(err) {
+        db.run('DELETE FROM items WHERE id = ?', [itemId], function (err) {
             if (err) {
                 req.session.error = `Failed to delete item. Error: ${err.message}`;
                 res.redirect(`/inventory/view/${itemId}`);
@@ -934,7 +1517,7 @@ app.post('/inventory/delete/:id', requireRole(['admin']), (req, res) => {
                         if (unlinkErr) console.error("Error deleting image file:", unlinkErr);
                     });
                 }
-                logAction(req.session.user, 'Deleted Item', { id: itemId, name: item.name }, '', req.ip);
+                logAction(req.session.user, 'Deleted Item', { id: itemId, name: item.name }, 'Item permanently deleted.', req.ip);
                 req.session.success = `Item "${item.name}" has been permanently deleted.`;
                 res.redirect('/inventory');
             }
@@ -942,365 +1525,330 @@ app.post('/inventory/delete/:id', requireRole(['admin']), (req, res) => {
     });
 });
 
-// --- Check-in / Check-out Logic ---
+// Kit and Related Items Management
+app.post('/inventory/kit/add/:kitId', requireRole(['admin', 'manager']), (req, res) => {
+    const { kitId } = req.params;
+    const { item_id } = req.body;
+    db.run('INSERT INTO kits (kit_id, item_id) VALUES (?, ?)', [kitId, item_id], function (err) {
+        if (err) {
+            req.session.error = "Failed to add component. It might already be in the kit.";
+        } else {
+            logAction(req.session.user, 'Added Kit Component', { id: kitId }, `Added item ID ${item_id}`, req.ip);
+            req.session.success = "Component added to kit.";
+        }
+        res.redirect(`/inventory/edit/${kitId}`);
+    });
+});
+
+app.post('/inventory/kit/remove/:kitId/:itemId', requireRole(['admin', 'manager']), (req, res) => {
+    const { kitId, itemId } = req.params;
+    db.run('DELETE FROM kits WHERE kit_id = ? AND item_id = ?', [kitId, itemId], function (err) {
+        if (err) {
+            req.session.error = "Failed to remove component.";
+        } else {
+            logAction(req.session.user, 'Removed Kit Component', { id: kitId }, `Removed item ID ${itemId}`, req.ip);
+            req.session.success = "Component removed from kit.";
+        }
+        res.redirect(`/inventory/edit/${kitId}`);
+    });
+});
+
+app.post('/inventory/related/add/:itemId', requireRole(['admin', 'manager']), (req, res) => {
+    const { itemId } = req.params;
+    const { related_item_id } = req.body;
+    // Insert in a consistent order to avoid duplicates (e.g. 1-2 and 2-1)
+    const [item_a_id, item_b_id] = [itemId, related_item_id].sort();
+    db.run('INSERT INTO related_items (item_a_id, item_b_id) VALUES (?, ?)', [item_a_id, item_b_id], function (err) {
+        if (err) {
+            req.session.error = "Failed to add relation. It might already exist.";
+        } else {
+            logAction(req.session.user, 'Added Related Item', { id: itemId }, `Related to item ID ${related_item_id}`, req.ip);
+            req.session.success = "Item relation added.";
+        }
+        res.redirect(`/inventory/edit/${itemId}`);
+    });
+});
+
+app.post('/inventory/related/remove/:itemId/:relatedItemId', requireRole(['admin', 'manager']), (req, res) => {
+    const { itemId, relatedItemId } = req.params;
+    const [item_a_id, item_b_id] = [itemId, relatedItemId].sort();
+    db.run('DELETE FROM related_items WHERE item_a_id = ? AND item_b_id = ?', [item_a_id, item_b_id], function (err) {
+        if (err) {
+            req.session.error = "Failed to remove relation.";
+        } else {
+            logAction(req.session.user, 'Removed Related Item', { id: itemId }, `Removed relation to item ID ${relatedItemId}`, req.ip);
+            req.session.success = "Item relation removed.";
+        }
+        res.redirect(`/inventory/edit/${itemId}`);
+    });
+});
+
+// Check-in / Check-out / Use Logic
 app.post('/inventory/checkout/:id', requireLogin, (req, res) => {
     const itemId = req.params.id;
     const userId = req.session.user.id;
-    const sql = `UPDATE items SET status = 'Checked Out', checked_out_by_id = ?, last_activity_date = CURRENT_TIMESTAMP WHERE id = ? AND status = 'Available'`;
-    db.run(sql, [userId, itemId], function(err) {
-        if (err || this.changes === 0) {
-            req.session.error = "Failed to check out item. It may already be checked out or in maintenance.";
-        } else {
-            req.session.success = "Item checked out successfully!";
-            logAction(req.session.user, 'Checked Out Item', { id: itemId }, '', req.ip);
+    const { project_id } = req.body; // For project-based checkouts
+
+    db.get('SELECT * FROM items WHERE id = ?', [itemId], (err, item) => {
+        if (err || !item) {
+            req.session.error = "Item not found.";
+            return res.redirect(req.get('referer') || '/inventory');
         }
-        res.redirect(req.get('referer') || '/inventory');
+
+        const itemsToCheckOut = [item];
+
+        const processCheckout = () => {
+            db.serialize(() => {
+                db.run('BEGIN TRANSACTION');
+                let hadError = false;
+                itemsToCheckOut.forEach(thing => {
+                    const newQuantityCheckedOut = thing.quantity_checked_out + 1;
+                    const newStatus = newQuantityCheckedOut >= thing.quantity ? 'Checked Out' : 'Available';
+                    db.run('UPDATE items SET quantity_checked_out = ?, status = ?, last_activity_date = CURRENT_TIMESTAMP, checked_out_by_id = ? WHERE id = ?',
+                        [newQuantityCheckedOut, newStatus, userId, thing.id], function (err) {
+                            if (err) hadError = true;
+                        });
+                    // If part of a project, log it
+                    if (project_id) {
+                        db.run('INSERT INTO project_checkouts (project_id, item_id, user_id) VALUES (?, ?, ?)', [project_id, thing.id, userId], (err) => { if (err) hadError = true; });
+                    }
+                });
+                db.run('COMMIT', (err) => {
+                    if (err || hadError) {
+                        db.run('ROLLBACK');
+                        req.session.error = `A database error occurred during checkout.`;
+                    } else {
+                        logAction(req.session.user, item.is_kit ? 'Checked Out Kit' : 'Checked Out Item', item, project_id ? `For project ID ${project_id}` : '', req.ip);
+                        req.session.success = `"${item.name}" checked out successfully.`;
+                    }
+                    res.redirect(req.get('referer') || '/inventory');
+                });
+            });
+        };
+
+        if (item.is_kit) {
+            db.all('SELECT * FROM items i JOIN kits k ON i.id = k.item_id WHERE k.kit_id = ?', [itemId], (err, components) => {
+                const unavailable = components.find(c => c.quantity_checked_out >= c.quantity);
+                if (unavailable) {
+                    req.session.error = `Cannot check out kit. Component "${unavailable.name}" is not available.`;
+                    return res.redirect(req.get('referer') || `/inventory/view/${itemId}`);
+                }
+                itemsToCheckOut.push(...components);
+                processCheckout();
+            });
+        } else {
+            if (item.quantity_checked_out >= item.quantity) {
+                req.session.error = `"${item.name}" is not available for checkout.`;
+                return res.redirect(req.get('referer') || `/inventory/view/${itemId}`);
+            }
+            processCheckout();
+        }
     });
 });
 
 app.post('/inventory/checkin/:id', requireLogin, (req, res) => {
     const itemId = req.params.id;
     const userId = req.session.user.id;
-    // Admin/manager can check in any item, users only their own
-    const condition = req.session.user.role === 'user' ? `AND checked_out_by_id = ${userId}` : '';
-    const sql = `UPDATE items SET status = 'Available', checked_out_by_id = NULL, last_activity_date = CURRENT_TIMESTAMP WHERE id = ? AND status = 'Checked Out' ${condition}`;
-    db.run(sql, [itemId], function(err) {
-        if (err || this.changes === 0) {
-            req.session.error = "Failed to check in item. You may not have it checked out or it is not currently checked out.";
-        } else {
-            req.session.success = "Item checked in successfully!";
-            logAction(req.session.user, 'Checked In Item', { id: itemId }, '', req.ip);
+
+    db.get('SELECT * FROM items WHERE id = ?', [itemId], (err, item) => {
+        if (err || !item) {
+            req.session.error = "Item not found.";
+            return res.redirect(req.get('referer') || '/inventory');
         }
-        res.redirect(req.get('referer') || '/inventory');
+
+        const itemsToCheckIn = [item];
+
+        const processCheckin = () => {
+            db.serialize(() => {
+                db.run('BEGIN TRANSACTION');
+                let hadError = false;
+                itemsToCheckIn.forEach(thing => {
+                    const newQuantityCheckedOut = Math.max(0, thing.quantity_checked_out - 1);
+                    const newStatus = 'Available'; // Always becomes available after a check-in
+
+                    let updateSql = 'UPDATE items SET quantity_checked_out = ?, status = ?, last_activity_date = CURRENT_TIMESTAMP WHERE id = ?';
+                    let params = [newQuantityCheckedOut, newStatus, thing.id];
+
+                    if (newQuantityCheckedOut === 0) {
+                        updateSql = 'UPDATE items SET quantity_checked_out = ?, status = ?, last_activity_date = CURRENT_TIMESTAMP, checked_out_by_id = NULL WHERE id = ?';
+                        params = [newQuantityCheckedOut, 'Available', thing.id];
+                    }
+
+                    db.run(updateSql, params, function (err) {
+                        if (err) hadError = true;
+                    });
+                    // Also remove from project checkouts
+                    db.run('DELETE FROM project_checkouts WHERE item_id = ? AND user_id = ?', [thing.id, userId], (err) => { if (err) hadError = true; });
+                });
+                db.run('COMMIT', (err) => {
+                    if (err || hadError) {
+                        db.run('ROLLBACK');
+                        req.session.error = `A database error occurred during check-in.`;
+                    } else {
+                        logAction(req.session.user, item.is_kit ? 'Checked In Kit' : 'Checked In Item', item, '', req.ip);
+                        req.session.success = `"${item.name}" checked in successfully.`;
+                    }
+                    res.redirect(req.get('referer') || '/inventory');
+                });
+            });
+        };
+
+        if (item.quantity_checked_out <= 0) {
+            req.session.error = `Cannot check in "${item.name}". It is already fully checked in.`;
+            return res.redirect(req.get('referer') || `/inventory/view/${itemId}`);
+        }
+
+        if (item.is_kit) {
+            db.all('SELECT * FROM items i JOIN kits k ON i.id = k.item_id WHERE k.kit_id = ?', [itemId], (err, components) => {
+                itemsToCheckIn.push(...components);
+                processCheckin();
+            });
+        } else {
+            processCheckin();
+        }
     });
 });
+
+app.post('/inventory/use/:id', requireLogin, (req, res) => {
+    const itemId = req.params.id;
+    const quantityUsed = parseInt(req.body.quantity_used, 10);
+
+    db.get('SELECT * FROM items WHERE id = ?', [itemId], (err, item) => {
+        if (err || !item || !item.is_consumable) {
+            req.session.error = "Consumable item not found.";
+            return res.redirect('/inventory');
+        }
+        if (isNaN(quantityUsed) || quantityUsed <= 0 || quantityUsed > item.quantity) {
+            req.session.error = "Invalid quantity specified.";
+            return res.redirect(`/inventory/view/${itemId}`);
+        }
+
+        const newQuantity = item.quantity - quantityUsed;
+        db.run('UPDATE items SET quantity = ? WHERE id = ?', [newQuantity, itemId], function (err) {
+            if (err) {
+                req.session.error = "Failed to update item quantity.";
+            } else {
+                logAction(req.session.user, 'Used Consumable', item, `Used quantity: ${quantityUsed}, remaining: ${newQuantity}`, req.ip);
+                req.session.success = `Successfully used ${quantityUsed} of "${item.name}".`;
+
+                // Low stock check
+                if (item.low_stock_threshold && newQuantity < item.low_stock_threshold) {
+                    // Check for an existing pending request for this item
+                    db.get("SELECT id FROM purchase_requests WHERE item_name = ? AND status = 'Pending'", [item.name], (err, existingRequest) => {
+                        if (!existingRequest) {
+                            const reason = `Automatic request: Stock dropped to ${newQuantity}, which is below the threshold of ${item.low_stock_threshold}.`;
+                            db.run("INSERT INTO purchase_requests (item_name, reason, requested_by_id) VALUES (?, ?, NULL)", [item.name, reason]);
+                            logAction(null, 'Auto-generated Purchase Request', item, `Stock at ${newQuantity}`);
+                        }
+                    });
+                }
+            }
+            res.redirect(`/inventory/view/${itemId}`);
+        });
+    });
+});
+
 
 // --- Maintenance ---
 app.post('/maintenance/report/:id', requireLogin, (req, res) => {
     const itemId = req.params.id;
     const { description } = req.body;
-    db.run('INSERT INTO maintenance_log (item_id, user_id, description) VALUES (?, ?, ?)', [itemId, req.session.user.id, description], function(err) {
+    db.run('INSERT INTO maintenance_log (item_id, user_id, description) VALUES (?, ?, ?)', [itemId, req.session.user.id, description], function (err) {
         if (err) {
             req.session.error = "Failed to report issue.";
+            res.redirect(`/inventory/view/${itemId}`);
         } else {
-            db.run("UPDATE items SET status = 'Under Maintenance' WHERE id = ?", [itemId]);
-            logAction(req.session.user, 'Reported Maintenance', { id: itemId }, description, req.ip);
-            req.session.success = "Maintenance issue reported. Item status has been updated.";
+            db.run("UPDATE items SET status = 'Under Maintenance' WHERE id = ?", [itemId], () => {
+                db.get('SELECT name FROM items WHERE id = ?', [itemId], (err, item) => {
+                    logAction(req.session.user, 'Reported Maintenance', item, description, req.ip);
+                    req.session.success = "Maintenance issue reported. Item status has been updated.";
+                    res.redirect(`/inventory/view/${itemId}`);
+                });
+            });
         }
-        res.redirect(`/inventory/view/${itemId}`);
     });
 });
 
+app.post('/maintenance/resolve/:log_id', requireRole(['admin', 'manager']), (req, res) => {
+    const { log_id } = req.params;
+    const { resolution_notes } = req.body;
 
-// --- Admin: User Management ---
-app.get('/users', requireRole(['admin']), (req, res) => {
-    db.all("SELECT * FROM users", (err, users) => {
-        const usersHtml = users.map(u => {
-            let statusBadge = '';
-            switch(u.status) {
-                case 'active': statusBadge = '<span class="bg-green-100 text-green-800 text-xs font-medium px-2.5 py-0.5 rounded-full">Active</span>'; break;
-                case 'timed_out': statusBadge = `<span class="bg-yellow-100 text-yellow-800 text-xs font-medium px-2.5 py-0.5 rounded-full">Timed Out</span>`; break;
-                case 'banned': statusBadge = '<span class="bg-red-100 text-red-800 text-xs font-medium px-2.5 py-0.5 rounded-full">Banned</span>'; break;
+    db.get("SELECT item_id FROM maintenance_log WHERE id = ?", [log_id], (err, log) => {
+        if (err || !log) {
+            req.session.error = "Maintenance log not found.";
+            return res.redirect('/inventory');
+        }
+
+        const sql = "UPDATE maintenance_log SET resolved_date = CURRENT_TIMESTAMP, resolution_notes = ? WHERE id = ?";
+        db.run(sql, [resolution_notes, log_id], (err) => {
+            if (err) {
+                req.session.error = "Failed to resolve maintenance issue.";
+                return res.redirect(`/inventory/view/${log.item_id}`);
             }
-            // Prevent admins from moderating other admins
-            let actions = u.role === 'admin' ? 'N/A' : `
-                 <a href="/users/view/${u.id}" class="text-sky-600 hover:underline">Details</a>
-            `;
-            
-            return `
-             <tr class="border-b">
-                <td class="py-2 px-4">${u.name}</td>
-                <td class="py-2 px-4">${u.student_id}</td>
-                <td class="py-2 px-4 capitalize">${u.role}</td>
-                <td class="py-2 px-4">${statusBadge}</td>
-                <td class="py-2 px-4">${actions}</td>
-            </tr>
-            `;
-        }).join('');
 
-        const content = `
-        <div class="card">
-             <h2 class="text-xl font-bold mb-4">User Accounts</h2>
-             <div class="overflow-x-auto">
-                 <table class="w-full text-left">
-                    <thead><tr class="border-b-2">
-                        <th class="py-2 px-4">Name</th><th class="py-2 px-4">Student ID</th><th class="py-2 px-4">Role</th><th class="py-2 px-4">Status</th><th class="py-2 px-4">Actions</th>
-                    </tr></thead>
-                    <tbody>${usersHtml}</tbody>
-                </table>
-             </div>
-        </div>
-        `;
-        res.send(renderPage(req, 'User Management', req.session.user, content));
-    });
-});
-
-app.get('/users/view/:id', requireRole(['admin']), (req, res) => {
-    const userId = req.params.id;
-    db.get("SELECT * FROM users WHERE id = ?", [userId], (err, user) => {
-        if(err || !user) {
-            req.session.error = "User not found.";
-            return res.redirect('/users');
-        }
-
-        db.all("SELECT * FROM audit_log WHERE user_id = ? ORDER BY timestamp DESC", [userId], (err, logs) => {
-            db.all("SELECT DISTINCT ip_address FROM audit_log WHERE user_id = ? AND ip_address IS NOT NULL", [userId], (err, ips) => {
-                
-                const logsHtml = logs.map(l => `
-                    <tr class="border-b">
-                        <td class="p-2">${new Date(l.timestamp).toLocaleString()}</td>
-                        <td class="p-2">${l.action}</td>
-                        <td class="p-2">${l.item_name || 'N/A'}</td>
-                        <td class="p-2">${l.ip_address || 'N/A'}</td>
-                    </tr>
-                `).join('');
-
-                let moderationForm = '';
-                let dangerZone = '';
-                if(user.role !== 'admin') {
-                    if (user.status === 'active') {
-                        moderationForm = `
-                            <form action="/users/timeout/${user.id}" method="POST" class="mb-2">
-                                <label>Duration (hours)</label>
-                                <input type="number" name="duration" value="24" class="p-1 border rounded">
-                                <button type="submit" class="btn btn-warning">Timeout</button>
-                            </form>
-                            <form action="/users/ban/${user.id}" method="POST" onsubmit="return confirm('Ban this user? This is permanent.')">
-                                <button type="submit" class="btn btn-danger">Ban</button>
-                            </form>
-                        `;
-                    } else {
-                         moderationForm = `
-                            <form action="/users/reactivate/${user.id}" method="POST">
-                                <button type="submit" class="btn btn-primary">Reactivate</button>
-                            </form>
-                        `;
+            db.get("SELECT id FROM maintenance_log WHERE item_id = ? AND resolved_date IS NULL", [log.item_id], (err, other_log) => {
+                let newStatus = 'Available'; // Default to available
+                db.get('SELECT quantity_checked_out, quantity FROM items WHERE id = ?', [log.item_id], (err, item) => {
+                    if (item && item.quantity_checked_out > 0) {
+                        newStatus = 'Checked Out';
                     }
-                    // Add Delete User form to the Danger Zone
-                    dangerZone = `
-                        <div class="card mt-6 border-t-4 border-red-500">
-                            <h2 class="text-xl font-bold mb-4 text-red-700">Danger Zone</h2>
-                            <form action="/users/delete/${user.id}" method="POST" onsubmit="return confirm('Are you sure you want to permanently delete this user? This action cannot be undone.');">
-                                <button type="submit" class="btn btn-danger w-full">Delete User Permanently</button>
-                            </form>
-                        </div>
-                    `;
-                }
-                
-                let roleManagementForm = '';
-                if(user.role !== 'admin') {
-                    roleManagementForm = `
-                        <div class="card mt-6">
-                            <h2 class="text-xl font-bold mb-4">Change Role</h2>
-                            <form action="/users/update-role/${user.id}" method="POST">
-                                <select name="role" class="w-full p-2 border rounded mb-2">
-                                    <option value="user" ${user.role === 'user' ? 'selected' : ''}>User</option>
-                                    <option value="manager" ${user.role === 'manager' ? 'selected' : ''}>Manager</option>
-                                </select>
-                                <button type="submit" class="btn btn-primary w-full">Set Role</button>
-                            </form>
-                        </div>
-                    `;
-                }
+                    if (!other_log) {
+                        db.run("UPDATE items SET status = ? WHERE id = ?", [newStatus, log.item_id]);
+                    }
+                    db.get('SELECT name FROM items WHERE id = ?', [log.item_id], (err, item) => {
+                        logAction(req.session.user, 'Resolved Maintenance', item, resolution_notes, req.ip);
+                        req.session.success = "Maintenance issue has been resolved.";
+                        res.redirect(`/inventory/view/${log.item_id}`);
+                    });
+                });
+            });
+        });
+    });
+});
 
-                const content = `
-                <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
-                    <div class="lg:col-span-2">
-                        <div class="card">
-                            <h2 class="text-xl font-bold mb-4">User Audit Log</h2>
-                            <table class="w-full text-sm text-left">
-                                <thead><tr class="border-b-2">
-                                    <th class="p-2">Timestamp</th><th class="p-2">Action</th><th class="p-2">Item</th><th class="p-2">IP</th>
-                                </tr></thead>
-                                <tbody>${logsHtml}</tbody>
-                            </table>
-                        </div>
-                    </div>
-                    <div>
-                        <div class="card">
-                             <h2 class="text-xl font-bold mb-4">User Details</h2>
-                             <p><strong>Name:</strong> ${user.name}</p>
-                             <p><strong>Student ID:</strong> ${user.student_id}</p>
-                             <p><strong>Role:</strong> ${user.role}</p>
-                             <p><strong>Status:</strong> ${user.status}</p>
-                             ${user.status === 'timed_out' ? `<p><strong>Timeout Ends:</strong> ${new Date(user.timeout_until).toLocaleString()}</p>` : ''}
-                        </div>
-                        <div class="card mt-6">
-                            <h2 class="text-xl font-bold mb-4">Moderation</h2>
-                            ${moderationForm}
-                        </div>
-                        ${roleManagementForm}
-                        <div class="card mt-6">
-                            <h2 class="text-xl font-bold mb-4">Known IP Addresses</h2>
-                            <ul class="list-disc list-inside">
-                                ${ips.map(ip => `<li>${ip.ip_address}</li>`).join('')}
-                            </ul>
-                        </div>
-                        ${dangerZone}
-                    </div>
+// --- Purchase Requests ---
+app.get('/requests/new', requireLogin, (req, res) => {
+    const content = `
+        <div class="card max-w-2xl mx-auto">
+            <form action="/requests/new" method="POST">
+                <div class="mb-4">
+                    <label for="item_name" class="block font-bold text-gray-700">Item Name*</label>
+                    <input type="text" name="item_name" id="item_name" class="w-full p-2 border rounded" required>
                 </div>
-                `;
-                res.send(renderPage(req, `User Details: ${user.name}`, req.session.user, content));
-            });
-        });
-    });
+                <div class="mb-4">
+                    <label for="link" class="block font-bold text-gray-700">Link to Purchase (optional)</label>
+                    <input type="url" name="link" id="link" class="w-full p-2 border rounded" placeholder="https://example.com/item">
+                </div>
+                <div class="mb-4">
+                    <label for="reason" class="block font-bold text-gray-700">Reason for Request*</label>
+                    <textarea name="reason" id="reason" class="w-full p-2 border rounded" rows="4" required></textarea>
+                </div>
+                <button type="submit" class="btn btn-primary">Submit Request</button>
+            </form>
+        </div>
+    `;
+    res.send(renderPage(req, 'Request New Item', req.session.user, content));
 });
 
-app.post('/users/update-role/:id', requireRole(['admin']), (req, res) => {
-    const userId = req.params.id;
-    const { role } = req.body;
-    if (!['user', 'manager'].includes(role)) {
-        req.session.error = "Invalid role selected.";
-        return res.redirect(`/users/view/${userId}`);
-    }
-    
-    db.get("SELECT role FROM users WHERE id = ?", [userId], (err, userToUpdate) => {
-        if (err || !userToUpdate) {
-            req.session.error = "User not found.";
-            return res.redirect('/users');
+app.post('/requests/new', requireLogin, (req, res) => {
+    const { item_name, link, reason } = req.body;
+    const requested_by_id = req.session.user.id;
+
+    const sql = 'INSERT INTO purchase_requests (requested_by_id, item_name, link, reason) VALUES (?, ?, ?, ?)';
+    db.run(sql, [requested_by_id, item_name, link, reason], function (err) {
+        if (err) {
+            req.session.error = "Failed to submit purchase request.";
+            res.redirect('/requests/new');
+        } else {
+            logAction(req.session.user, 'Submitted Purchase Request', null, `Item: ${item_name}`, req.ip);
+            req.session.success = "Purchase request submitted successfully.";
+            res.redirect('/dashboard');
         }
-        if (userToUpdate.role === 'admin') {
-            req.session.error = "Cannot change the role of an administrator.";
-            return res.redirect('/users');
-        }
-        db.run("UPDATE users SET role = ? WHERE id = ?", [role, userId], function(err) {
-            if (err) {
-                req.session.error = "Failed to update user role.";
-            } else {
-                logAction(req.session.user, 'Updated User Role', null, `Set User ID ${userId} to ${role}`, req.ip);
-                req.session.success = "User role updated successfully.";
-            }
-            res.redirect(`/users/view/${userId}`);
-        });
-    });
-});
-
-app.post('/users/timeout/:id', requireRole(['admin']), (req, res) => {
-    const userId = req.params.id;
-    const durationHours = parseInt(req.body.duration, 10) || 24;
-    const timeoutUntil = new Date();
-    timeoutUntil.setHours(timeoutUntil.getHours() + durationHours);
-
-    db.run("UPDATE users SET status = 'timed_out', timeout_until = ? WHERE id = ? AND role != 'admin'", [timeoutUntil, userId], function(err) {
-        if(err) { req.session.error = "Failed to time out user."; }
-        else {
-            logAction(req.session.user, 'Timed Out User', null, `User ID: ${userId} for ${durationHours} hours.`, req.ip);
-            req.session.success = "User has been placed in timeout.";
-        }
-        res.redirect(`/users/view/${userId}`);
-    });
-});
-
-app.post('/users/ban/:id', requireRole(['admin']), (req, res) => {
-    const userId = req.params.id;
-    db.run("UPDATE users SET status = 'banned' WHERE id = ? AND role != 'admin'", [userId], function(err) {
-         if(err) { req.session.error = "Failed to ban user."; }
-         else {
-             logAction(req.session.user, 'Banned User', null, `User ID: ${userId}`, req.ip);
-             req.session.success = "User has been banned.";
-         }
-        res.redirect(`/users/view/${userId}`);
-    });
-});
-
-app.post('/users/reactivate/:id', requireRole(['admin']), (req, res) => {
-    const userId = req.params.id;
-    db.run("UPDATE users SET status = 'active', timeout_until = NULL WHERE id = ?", [userId], function(err) {
-         if(err) { req.session.error = "Failed to reactivate user."; }
-         else {
-             logAction(req.session.user, 'Reactivated User', null, `User ID: ${userId}`, req.ip);
-             req.session.success = "User has been reactivated.";
-         }
-        res.redirect(`/users/view/${userId}`);
-    });
-});
-
-// NEW ROUTE: Delete User
-app.post('/users/delete/:id', requireRole(['admin']), (req, res) => {
-    const userIdToDelete = req.params.id;
-    const adminUserId = req.session.user.id;
-
-    // Safety check: Admin cannot delete themselves
-    if (userIdToDelete == adminUserId) {
-        req.session.error = "You cannot delete your own account.";
-        return res.redirect('/users');
-    }
-
-    db.get('SELECT * FROM users WHERE id = ?', [userIdToDelete], (err, user) => {
-        if (err || !user) {
-            req.session.error = "User not found.";
-            return res.redirect('/users');
-        }
-
-        // Safety check: Do not delete other admins
-        if (user.role === 'admin') {
-            req.session.error = "Administrators cannot be deleted.";
-            return res.redirect(`/users/view/${userIdToDelete}`);
-        }
-
-        // Safety check: Verify the user does not have any items currently checked out
-        db.get('SELECT id, name FROM items WHERE checked_out_by_id = ?', [userIdToDelete], (err, item) => {
-            if (err) {
-                req.session.error = "Database error while checking for checked-out items.";
-                return res.redirect(`/users/view/${userIdToDelete}`);
-            }
-            if (item) {
-                req.session.error = `Cannot delete user. They still have item "${item.name}" checked out. Please check in all items first.`;
-                return res.redirect(`/users/view/${userIdToDelete}`);
-            }
-
-            // Proceed with deletion
-            db.run('DELETE FROM users WHERE id = ?', [userIdToDelete], function(err) {
-                if (err) {
-                    req.session.error = `Failed to delete user. Error: ${err.message}`;
-                    return res.redirect(`/users/view/${userIdToDelete}`);
-                }
-                logAction(req.session.user, 'Deleted User', null, `Deleted user: ${user.name} (ID: ${userIdToDelete})`, req.ip);
-                req.session.success = `User "${user.name}" has been permanently deleted.`;
-                res.redirect('/users');
-            });
-        });
     });
 });
 
 
-app.get('/request-password-reset', (req, res) => {
-    const content = `<div class="card max-w-md mx-auto">
-        <h2 class="text-xl font-bold mb-4">Request Password Reset</h2>
-        <p class="mb-4">Enter your Student ID. If it exists, an admin will be notified to reset your password.</p>
-        <form action="/request-password-reset" method="POST">
-             <div class="mb-4">
-                <label class="block text-gray-700">Student ID</label>
-                <input type="text" name="student_id" class="w-full p-2 border rounded" required>
-            </div>
-            <button type="submit" class="btn btn-primary w-full">Submit Request</button>
-            <div class="text-center mt-4">
-                <a href="/login" class="text-sm text-sky-600 hover:underline">Back to Login</a>
-            </div>
-        </form>
-    </div>`;
-    res.send(renderPage(req, 'Password Reset', null, content));
-});
-
-app.post('/request-password-reset', (req, res) => {
-    const { student_id } = req.body;
-    db.get('SELECT id FROM users WHERE student_id = ?', [student_id], (err, user) => {
-        if(user) {
-            // Avoid creating duplicate pending requests
-            db.get('SELECT id FROM password_resets WHERE user_id = ? AND status = ?', [user.id, 'Pending'], (err, existing) => {
-                if(!existing) {
-                    db.run('INSERT INTO password_resets (user_id, status) VALUES (?, ?)', [user.id, 'Pending']);
-                }
-            });
-        }
-        // Always show a generic success message to prevent user enumeration (leaking which student IDs are valid)
-        req.session.success = "If your account exists, a password reset request has been sent to the administrator.";
-        res.redirect('/login');
-    });
-});
-
-// --- FULLY IMPLEMENTED ROUTES ---
-
+// --- Reservations ---
 app.get('/reservations', requireLogin, (req, res) => {
     const today = new Date();
     const monthQuery = req.query.month;
@@ -1331,7 +1879,7 @@ app.get('/reservations', requireLogin, (req, res) => {
     const endDateStr = `${year}-${String(month + 1).padStart(2, '0')}-${lastDay.getDate()}`;
 
     db.all(sql, [startDateStr, endDateStr, startDateStr, endDateStr], (err, reservations) => {
-        db.all('SELECT id, name FROM items ORDER BY name', (err, items) => {
+        db.all('SELECT id, name FROM items WHERE status != "Archived" AND is_consumable = 0 ORDER BY name', (err, items) => {
 
             let calendarHtml = '';
             const daysInMonth = lastDay.getDate();
@@ -1348,13 +1896,13 @@ app.get('/reservations', requireLogin, (req, res) => {
                     const end = new Date(r.end_date + 'T00:00:00');
                     return currentDate >= start && currentDate <= end;
                 });
-                
+
                 let eventsHtml = reservationsForDay.map(r => {
-                     let cancelForm = '';
-                     if(req.session.user.role !== 'user' || r.user_id === req.session.user.id) {
-                         cancelForm = `<form class="inline" action="/reservations/cancel/${r.id}" method="POST"><button class="text-red-500 text-xs hover:underline ml-1">(Cancel)</button></form>`;
-                     }
-                     return `
+                    let cancelForm = '';
+                    if (req.session.user.role !== 'user' || r.user_id === req.session.user.id) {
+                        cancelForm = `<form class="inline" action="/reservations/cancel/${r.id}" method="POST"><button class="text-red-500 text-xs hover:underline ml-1">(Cancel)</button></form>`;
+                    }
+                    return `
                         <li class="bg-sky-100 p-1 rounded">
                             <p class="font-semibold">${r.item_name}</p>
                             <p>${r.user_name} ${cancelForm}</p>
@@ -1370,8 +1918,8 @@ app.get('/reservations', requireLogin, (req, res) => {
             }
 
             const content = `
-                <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
-                    <div class="lg:col-span-2 card">
+                <div class="grid grid-cols-1 xl:grid-cols-3 gap-6">
+                    <div class="xl:col-span-2 card">
                         <div class="flex justify-between items-center mb-4">
                             <a href="/reservations?year=${prevYear}&month=${prevMonth}" class="btn btn-secondary">&lt; Prev</a>
                             <h2 class="text-xl font-bold">${monthName} ${year}</h2>
@@ -1399,25 +1947,53 @@ app.get('/reservations', requireLogin, (req, res) => {
                             </div>
                             <div class="mb-4">
                                 <label class="block">Start Date</label>
-                                <input type="date" name="start_date" class="w-full p-2 border rounded" required>
+                                <input type="date" name="start_date" id="start_date" class="w-full p-2 border rounded" required>
                             </div>
                              <div class="mb-4">
                                 <label class="block">End Date</label>
-                                <input type="date" name="end_date" class="w-full p-2 border rounded" required>
+                                <input type="date" name="end_date" id="end_date" class="w-full p-2 border rounded" required>
+                                <p class="text-sm text-gray-500 mt-1">Max reservation: ${RESERVATION_LIMIT_DAYS} days.</p>
                             </div>
                             <button type="submit" class="btn btn-primary w-full">Reserve Item</button>
                         </form>
                     </div>
                 </div>
+                <script>
+                    const startDateInput = document.getElementById('start_date');
+                    const endDateInput = document.getElementById('end_date');
+                    
+                    startDateInput.addEventListener('change', () => {
+                        if (!startDateInput.value) return;
+                        
+                        const startDate = new Date(startDateInput.value + 'T00:00:00');
+                        endDateInput.min = startDateInput.value;
+                        
+                        const maxDate = new Date(startDate);
+                        maxDate.setDate(startDate.getDate() + ${RESERVATION_LIMIT_DAYS - 1});
+                        
+                        const maxDateString = maxDate.toISOString().split('T')[0];
+                        endDateInput.max = maxDateString;
+                    });
+                </script>
             `;
-            res.send(renderPage(req, 'Reservations', req.session.user, content));
+            res.send(renderPage(req, 'Reservations Calendar', req.session.user, content));
         });
     });
 });
 
 app.post('/reservations', requireLogin, (req, res) => {
     const { item_id, start_date, end_date } = req.body;
-    // Conflict check
+
+    const startDate = new Date(start_date);
+    const endDate = new Date(end_date);
+    const diffTime = Math.abs(endDate - startDate);
+    const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24)) + 1;
+
+    if (diffDays > RESERVATION_LIMIT_DAYS) {
+        req.session.error = `Reservation cannot be longer than ${RESERVATION_LIMIT_DAYS} days.`;
+        return res.redirect('/reservations');
+    }
+
     const sql = `SELECT id FROM reservations WHERE item_id = ? AND status = 'Active' AND (
         (start_date <= ? AND end_date >= ?) OR (start_date BETWEEN ? AND ?)
     )`;
@@ -1427,232 +2003,432 @@ app.post('/reservations', requireLogin, (req, res) => {
             return res.redirect('/reservations');
         }
         db.run('INSERT INTO reservations (item_id, user_id, start_date, end_date) VALUES (?, ?, ?, ?)',
-            [item_id, req.session.user.id, start_date, end_date], function(err) {
-            if (err) {
-                req.session.error = "Failed to create reservation.";
-            } else {
-                req.session.success = "Reservation created successfully.";
-                logAction(req.session.user, 'Created Reservation', { id: item_id }, '', req.ip);
+            [item_id, req.session.user.id, start_date, end_date], function (err) {
+                if (err) {
+                    req.session.error = "Failed to create reservation.";
+                    res.redirect('/reservations');
+                } else {
+                    db.get('SELECT name FROM items WHERE id = ?', [item_id], (err, item) => {
+                        req.session.success = "Reservation created successfully.";
+                        logAction(req.session.user, 'Created Reservation', item, `For ${start_date} to ${end_date}`, req.ip);
+                        res.redirect('/reservations');
+                    });
+                }
+            });
+    });
+});
+
+app.get('/my-reservations', requireLogin, (req, res) => {
+    const sql = `
+        SELECT r.*, i.name as item_name 
+        FROM reservations r
+        JOIN items i ON r.item_id = i.id
+        WHERE r.user_id = ?
+        ORDER BY r.start_date DESC
+    `;
+    db.all(sql, [req.session.user.id], (err, my_reservations) => {
+        if (err) {
+            req.session.error = "Could not load your reservations.";
+            return res.redirect('/dashboard');
+        }
+
+        const reservationsHtml = my_reservations.map(r => {
+            const today = new Date();
+            const endDate = new Date(r.end_date);
+            const canRequestExtension = r.status === 'Active' && endDate >= today;
+
+            let extensionHtml = '';
+            if (canRequestExtension) {
+                if (r.extension_status === 'None' || r.extension_status === 'Denied') {
+                    extensionHtml = `
+                        <form action="/reservations/request-extension/${r.id}" method="POST" class="mt-2">
+                             <input type="date" name="new_end_date" class="p-1 border rounded" required min="${r.end_date}">
+                             <textarea name="reason" class="w-full p-1 border rounded mt-1" placeholder="Reason for extension..."></textarea>
+                             <button type="submit" class="btn btn-secondary text-sm mt-1">Request Extension</button>
+                        </form>
+                    `;
+                } else if (r.extension_status === 'Pending') {
+                    extensionHtml = '<p class="mt-2 text-yellow-600 font-semibold">Extension request pending review.</p>';
+                } else if (r.extension_status === 'Approved') {
+                    extensionHtml = '<p class="mt-2 text-green-600 font-semibold">Extension approved!</p>';
+                }
             }
-            res.redirect('/reservations');
-        });
+
+            return `
+                <div class="card mb-4">
+                    <h3 class="text-lg font-bold">${r.item_name}</h3>
+                    <p><strong>From:</strong> ${r.start_date} <strong>To:</strong> ${r.end_date}</p>
+                    <p><strong>Status:</strong> ${r.status}</p>
+                    ${extensionHtml}
+                </div>
+            `;
+        }).join('');
+
+        const content = `<div>${my_reservations.length > 0 ? reservationsHtml : '<p>You have no reservations.</p>'}</div>`;
+        res.send(renderPage(req, 'My Reservations', req.session.user, content));
+    });
+});
+
+app.post('/reservations/request-extension/:id', requireLogin, (req, res) => {
+    const { id } = req.params;
+    const { new_end_date, reason } = req.body;
+
+    const sql = "UPDATE reservations SET requested_end_date = ?, extension_reason = ?, extension_status = 'Pending' WHERE id = ? AND user_id = ?";
+    db.run(sql, [new_end_date, reason, id, req.session.user.id], function (err) {
+        if (err || this.changes === 0) {
+            req.session.error = "Failed to request extension. It may not be your reservation.";
+        } else {
+            logAction(req.session.user, 'Requested Extension', null, `Reservation ID: ${id}`, req.ip);
+            req.session.success = "Extension request submitted successfully.";
+        }
+        res.redirect('/my-reservations');
     });
 });
 
 app.post('/reservations/cancel/:id', requireLogin, (req, res) => {
     const reservationId = req.params.id;
-    db.get('SELECT user_id FROM reservations WHERE id = ?', [reservationId], (err, reservation) => {
+    db.get('SELECT r.user_id, i.id as item_id, i.name as item_name FROM reservations r JOIN items i ON r.item_id = i.id WHERE r.id = ?', [reservationId], (err, reservation) => {
+        if (!reservation) {
+            req.session.error = "Reservation not found.";
+            return res.redirect('/reservations');
+        }
         if (req.session.user.role === 'user' && req.session.user.id !== reservation.user_id) {
             req.session.error = "You can only cancel your own reservations.";
             return res.redirect('/reservations');
         }
-        db.run("UPDATE reservations SET status = 'Cancelled' WHERE id = ?", [reservationId], function(err) {
+        db.run("UPDATE reservations SET status = 'Cancelled' WHERE id = ?", [reservationId], function (err) {
             if (err) {
                 req.session.error = "Failed to cancel reservation.";
             } else {
                 req.session.success = "Reservation cancelled.";
-                logAction(req.session.user, 'Cancelled Reservation', { id: reservationId }, '', req.ip);
+                logAction(req.session.user, 'Cancelled Reservation', { id: reservation.item_id, name: reservation.item_name }, `Reservation ID: ${reservationId}`, req.ip);
             }
-            res.redirect('/reservations');
+            res.redirect(req.get('referer') || '/my-reservations');
         });
     });
 });
 
 
-app.get('/my-history', requireLogin, (req, res) => {
-    const sql = `
-        SELECT item_id, item_name, action, details, timestamp 
-        FROM audit_log 
-        WHERE user_id = ? AND action IN ('Checked Out Item', 'Checked In Item')
-        ORDER BY timestamp DESC
-    `;
-    db.all(sql, [req.session.user.id], (err, logs) => {
-        if (err) {
-            req.session.error = "Could not retrieve your history.";
-            return res.redirect('/dashboard');
-        }
-        const historyHtml = logs.length > 0 ? logs.map(log => `
-            <tr class="border-b">
-                <td class="py-2 px-4">${new Date(log.timestamp).toLocaleString()}</td>
-                <td class="py-2 px-4"><a href="/inventory/view/${log.item_id}" class="text-sky-600 hover:underline">${log.item_name || 'N/A'}</a></td>
-                <td class="py-2 px-4">${log.action}</td>
-            </tr>
-        `).join('') : '<tr><td colspan="3" class="text-center py-4">No history found.</td></tr>';
-
-        const content = `
-        <div class="card">
-            <table class="w-full text-left">
-                <thead><tr class="border-b-2">
-                    <th class="py-2 px-4">Date</th>
-                    <th class="py-2 px-4">Item Name</th>
-                    <th class="py-2 px-4">Action</th>
-                </tr></thead>
-                <tbody>${historyHtml}</tbody>
-            </table>
-        </div>`;
-        res.send(renderPage(req, 'My History', req.session.user, content));
-    });
-});
-
-app.get('/requests/new', requireLogin, (req, res) => {
-    const content = `
-    <div class="card max-w-2xl mx-auto">
-        <form action="/requests/new" method="POST">
-            <div class="mb-4">
-                <label class="block text-gray-700">Item Name*</label>
-                <input type="text" name="item_name" class="w-full p-2 border rounded" required>
-            </div>
-            <div class="mb-4">
-                <label class="block text-gray-700">Reason for Request*</label>
-                <textarea name="reason" class="w-full p-2 border rounded" required></textarea>
-            </div>
-            <div class="mb-4">
-                <label class="block text-gray-700">Link to Item (optional)</label>
-                <input type="url" name="link" class="w-full p-2 border rounded" placeholder="https://example.com/item">
-            </div>
-            <button type="submit" class="btn btn-primary">Submit Request</button>
-        </form>
-    </div>`;
-    res.send(renderPage(req, 'Request New Item', req.session.user, content));
-});
-
-app.post('/requests/new', requireLogin, (req, res) => {
-    const { item_name, reason, link } = req.body;
-    const sql = 'INSERT INTO purchase_requests (requested_by_id, item_name, reason, link) VALUES (?, ?, ?, ?)';
-    db.run(sql, [req.session.user.id, item_name, reason, link], function(err) {
-        if(err) {
-            req.session.error = "Failed to submit request.";
-            res.redirect('/requests/new');
-        } else {
-            logAction(req.session.user, 'Submitted Purchase Request', null, `Item: ${item_name}`, req.ip);
-            req.session.success = "Your purchase request has been submitted for review.";
-            res.redirect('/dashboard');
-        }
-    });
-});
-
+// --- Admin Pages ---
 app.get('/reports', requireRole(['admin', 'manager']), (req, res) => {
-    db.all("SELECT status, count(*) as count FROM items GROUP BY status", (err, itemStatusData) => {
-        if (err) {
-             return res.status(500).send(renderPage(req, 'Error', req.session.user, 'Could not load report data.'));
-        }
-        const availableCount = (itemStatusData.find(s => s.status === 'Available') || {count: 0}).count;
-        const checkedOutCount = (itemStatusData.find(s => s.status === 'Checked Out') || {count: 0}).count;
-        const maintenanceCount = (itemStatusData.find(s => s.status === 'Under Maintenance') || {count: 0}).count;
+    const { start, end } = req.query;
+    let dateFilter = '';
+    let dateParams = [];
 
-        const content = `
-        <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
-            <div class="card">
-                <h2 class="text-xl font-bold mb-4">Items by Status</h2>
-                <canvas id="itemStatusChart"></canvas>
-            </div>
-        </div>
-        <script>
-            if (document.getElementById('itemStatusChart')) {
-                const ctx = document.getElementById('itemStatusChart').getContext('2d');
-                new Chart(ctx, {
-                    type: 'doughnut',
-                    data: {
-                        labels: ['Available', 'Checked Out', 'Under Maintenance'],
-                        datasets: [{
-                            label: 'Item Status',
-                            data: [
-                                ${availableCount}, 
-                                ${checkedOutCount}, 
-                                ${maintenanceCount}
-                            ],
-                            backgroundColor: ['#22c55e', '#f59e0b', '#ef4444'],
-                        }]
-                    }
+    if (start && end) {
+        dateFilter = ' WHERE timestamp BETWEEN ? AND ?';
+        dateParams = [start, end];
+    }
+
+    const queries = {
+        itemsByCategory: "SELECT category, COUNT(*) as count FROM items WHERE status != 'Archived' GROUP BY category",
+        itemsByLocation: "SELECT l.name as location, COUNT(i.id) as count FROM locations l LEFT JOIN items i ON l.id = i.location_id WHERE i.status != 'Archived' GROUP BY l.name",
+        itemStatus: "SELECT status, COUNT(*) as count FROM items WHERE status != 'Archived' GROUP BY status",
+        itemUtilization: `SELECT item_id, item_name, COUNT(*) as action_count FROM audit_log WHERE action LIKE '%Check%' OR action LIKE '%Use%' ${dateFilter} GROUP BY item_id ORDER BY action_count DESC LIMIT 10`,
+        userActivity: `SELECT user_id, user_name, COUNT(*) as action_count FROM audit_log ${dateFilter} GROUP BY user_id ORDER BY action_count DESC LIMIT 10`
+    };
+
+    db.all(queries.itemsByCategory, (err, categoryData) => {
+        db.all(queries.itemsByLocation, (err, locationData) => {
+            db.all(queries.itemStatus, (err, statusData) => {
+                db.all(queries.itemUtilization, dateParams, (err, utilizationData) => {
+                    db.all(queries.userActivity, dateParams, (err, activityData) => {
+
+                        const content = `
+                            <div class="card mb-6">
+                                <h2 class="text-xl font-bold mb-4">Filter Reports by Date</h2>
+                                <form method="GET" action="/reports" class="flex flex-wrap items-end gap-4">
+                                    <div>
+                                        <label for="start">Start Date</label>
+                                        <input type="date" name="start" id="start" value="${start || ''}" class="w-full p-2 border rounded">
+                                    </div>
+                                    <div>
+                                        <label for="end">End Date</label>
+                                        <input type="date" name="end" id="end" value="${end || ''}" class="w-full p-2 border rounded">
+                                    </div>
+                                    <button type="submit" class="btn btn-primary">Filter</button>
+                                    <a href="/reports" class="btn btn-secondary">Clear</a>
+                                </form>
+                            </div>
+                            <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                                <div class="card">
+                                    <h2 class="text-xl font-bold mb-4 text-center">Items by Category</h2>
+                                    <canvas id="categoryChart"></canvas>
+                                </div>
+                                <div class="card">
+                                    <h2 class="text-xl font-bold mb-4 text-center">Item Status Distribution</h2>
+                                    <canvas id="statusChart"></canvas>
+                                </div>
+                                <div class="card lg:col-span-2">
+                                    <h2 class="text-xl font-bold mb-4 text-center">Items by Location</h2>
+                                    <canvas id="locationChart"></canvas>
+                                </div>
+                                <div class="card">
+                                     <h2 class="text-xl font-bold mb-4 text-center">Top 10 Most Used Items</h2>
+                                     <canvas id="utilizationChart"></canvas>
+                                </div>
+                                 <div class="card">
+                                     <h2 class="text-xl font-bold mb-4 text-center">Top 10 Most Active Users</h2>
+                                     <canvas id="activityChart"></canvas>
+                                </div>
+                            </div>
+
+                            <script>
+                                const categoryData = { labels: ${JSON.stringify(categoryData.map(d => d.category || 'Uncategorized'))}, datasets: [{ label: 'Items', data: ${JSON.stringify(categoryData.map(d => d.count))}, backgroundColor: ['#38bdf8', '#fbbf24', '#f87171', '#4ade80', '#a78bfa', '#fb923c'] }] };
+                                new Chart(document.getElementById('categoryChart'), { type: 'pie', data: categoryData });
+
+                                const statusData = { labels: ${JSON.stringify(statusData.map(d => d.status))}, datasets: [{ label: 'Status', data: ${JSON.stringify(statusData.map(d => d.count))}, backgroundColor: ['#4ade80', '#fbbf24', '#f87171'] }] };
+                                new Chart(document.getElementById('statusChart'), { type: 'doughnut', data: statusData });
+
+                                const locationData = { labels: ${JSON.stringify(locationData.map(d => d.location))}, datasets: [{ label: 'Number of Items', data: ${JSON.stringify(locationData.map(d => d.count))}, backgroundColor: '#0ea5e9' }] };
+                                new Chart(document.getElementById('locationChart'), { type: 'bar', data: locationData, options: { scales: { y: { beginAtZero: true } } } });
+                                
+                                const utilizationData = { labels: ${JSON.stringify(utilizationData.map(d => d.item_name))}, datasets: [{ label: 'Actions (Check Out/In, Use)', data: ${JSON.stringify(utilizationData.map(d => d.action_count))}, backgroundColor: '#8b5cf6' }] };
+                                new Chart(document.getElementById('utilizationChart'), { type: 'bar', data: utilizationData, options: { indexAxis: 'y', scales: { x: { beginAtZero: true } } } });
+                                
+                                const activityData = { labels: ${JSON.stringify(activityData.map(d => d.user_name))}, datasets: [{ label: 'Total Actions Logged', data: ${JSON.stringify(activityData.map(d => d.action_count))}, backgroundColor: '#db2777' }] };
+                                new Chart(document.getElementById('activityChart'), { type: 'bar', data: activityData, options: { indexAxis: 'y', scales: { x: { beginAtZero: true } } } });
+                            </script>
+                        `;
+                        res.send(renderPage(req, 'Reports', req.session.user, content));
+                    });
                 });
-            }
-        </script>
-        `;
-        res.send(renderPage(req, 'Reports', req.session.user, content));
+            });
+        });
     });
 });
 
 app.get('/admin/requests', requireRole(['admin', 'manager']), (req, res) => {
     const sql = `
-        SELECT pr.*, u.name as requester_name 
-        FROM purchase_requests pr 
-        JOIN users u ON pr.requested_by_id = u.id
+        SELECT pr.*, u_req.name as requester_name, u_rev.name as reviewer_name
+        FROM purchase_requests pr
+        LEFT JOIN users u_req ON pr.requested_by_id = u_req.id
+        LEFT JOIN users u_rev ON pr.reviewed_by_id = u_rev.id
         ORDER BY pr.request_date DESC
     `;
     db.all(sql, [], (err, requests) => {
-        const requestsHtml = requests.length > 0 ? requests.map(r => `
-            <tr class="border-b ${r.status === 'Pending' ? 'bg-yellow-50' : ''}">
-                <td class="py-2 px-4">${r.item_name} ${r.link ? `<a href="${r.link}" target="_blank" class="text-sky-500">(link)</a>` : ''}</td>
-                <td class="py-2 px-4">${r.requester_name}</td>
-                <td class="py-2 px-4">${r.reason}</td>
-                <td class="py-2 px-4">${r.status}</td>
-                <td class="py-2 px-4">
-                    ${r.status === 'Pending' ? `
-                    <div class="flex gap-2">
-                        <form action="/admin/requests/approve/${r.id}" method="POST">
-                            <button type="submit" class="btn btn-primary text-sm">Approve</button>
-                        </form>
-                         <form action="/admin/requests/deny/${r.id}" method="POST">
-                            <button type="submit" class="btn btn-danger text-sm">Deny</button>
-                        </form>
-                    </div>` : ''}
-                </td>
+        if (err) {
+            req.session.error = "Could not load purchase requests.";
+            return res.redirect('/dashboard');
+        }
+
+        const renderRequestRow = (r) => `
+            <tr class="border-b">
+                <td class="p-2">${new Date(r.request_date).toLocaleDateString()}</td>
+                <td class="p-2">${r.item_name}</td>
+                <td class="p-2">${r.requester_name || 'System'}</td>
+                <td class="p-2">${r.reason} ${r.link ? `<a href="${r.link}" target="_blank" class="text-sky-600">[Link]</a>` : ''}</td>
+                <td class="p-2">${r.status === 'Pending' ?
+                `<div class="flex gap-2">
+                        <form action="/admin/requests/approve/${r.id}" method="POST"><button class="btn btn-primary text-sm">Approve</button></form>
+                        <form action="/admin/requests/deny/${r.id}" method="POST"><button class="btn btn-danger text-sm">Deny</button></form>
+                    </div>` :
+                `Reviewed by ${r.reviewer_name || 'N/A'}`
+            }</td>
             </tr>
-        `).join('') : `<tr><td colspan="5" class="text-center py-4">No purchase requests found.</td></tr>`;
+        `;
+
+        const pending = requests.filter(r => r.status === 'Pending');
+        const reviewed = requests.filter(r => r.status !== 'Pending');
 
         const content = `
-        <div class="card">
-            <table class="w-full text-left">
-                <thead><tr class="border-b-2">
-                    <th class="py-2 px-4">Item</th>
-                    <th class="py-2 px-4">Requester</th>
-                    <th class="py-2 px-4">Reason</th>
-                    <th class="py-2 px-4">Status</th>
-                    <th class="py-2 px-4">Actions</th>
-                </tr></thead>
-                <tbody>${requestsHtml}</tbody>
-            </table>
-        </div>`;
+            <div class="card mb-6">
+                <h2 class="text-xl font-bold mb-4">Pending Requests</h2>
+                <div class="overflow-x-auto">
+                <table class="w-full text-left">
+                    <thead><tr class="border-b-2"><th class="p-2">Date</th><th class="p-2">Item</th><th class="p-2">Requester</th><th class="p-2">Reason</th><th class="p-2">Action</th></tr></thead>
+                    <tbody>
+                        ${pending.length > 0 ? pending.map(renderRequestRow).join('') : '<tr><td colspan="5" class="p-4 text-center">No pending requests.</td></tr>'}
+                    </tbody>
+                </table>
+                </div>
+            </div>
+            <div class="card">
+                <h2 class="text-xl font-bold mb-4">Reviewed Requests</h2>
+                <div class="overflow-x-auto">
+                <table class="w-full text-left">
+                    <thead><tr class="border-b-2"><th class="p-2">Date</th><th class="p-2">Item</th><th class="p-2">Requester</th><th class="p-2">Reason</th><th class="p-2">Outcome</th></tr></thead>
+                    <tbody>
+                         ${reviewed.length > 0 ? reviewed.map(r => `
+                            <tr class="border-b">
+                                <td class="p-2">${new Date(r.request_date).toLocaleDateString()}</td>
+                                <td class="p-2">${r.item_name}</td>
+                                <td class="p-2">${r.requester_name || 'System'}</td>
+                                <td class="p-2">${r.reason}</td>
+                                <td class="p-2">
+                                    <span class="${r.status === 'Approved' ? 'text-green-600' : 'text-red-600'} font-bold">${r.status}</span>
+                                    by ${r.reviewer_name || 'N/A'}
+                                </td>
+                            </tr>
+                         `).join('') : '<tr><td colspan="5" class="p-4 text-center">No reviewed requests.</td></tr>'}
+                    </tbody>
+                </table>
+                </div>
+            </div>
+        `;
         res.send(renderPage(req, 'Purchase Requests', req.session.user, content));
     });
 });
 
 app.post('/admin/requests/:action/:id', requireRole(['admin', 'manager']), (req, res) => {
     const { action, id } = req.params;
-    const status = action === 'approve' ? 'Approved' : 'Denied';
+    const reviewer_id = req.session.user.id;
 
-    db.get('SELECT * FROM purchase_requests WHERE id = ?', [id], (err, request) => {
-        if(err || !request) {
-            req.session.error = "Request not found.";
-            return res.redirect('/admin/requests');
+    if (!['approve', 'deny'].includes(action)) {
+        req.session.error = "Invalid action.";
+        return res.redirect('/admin/requests');
+    }
+
+    const newStatus = action === 'approve' ? 'Approved' : 'Denied';
+
+    const sql = 'UPDATE purchase_requests SET status = ?, reviewed_by_id = ?, review_date = CURRENT_TIMESTAMP WHERE id = ?';
+    db.run(sql, [newStatus, reviewer_id, id], function (err) {
+        if (err || this.changes === 0) {
+            req.session.error = "Failed to update purchase request.";
+            res.redirect('/admin/requests');
+        } else {
+            db.get('SELECT item_name FROM purchase_requests WHERE id = ?', [id], (err, request) => {
+                logAction(req.session.user, `Purchase Request ${newStatus}`, null, `Item: ${request.item_name}`, req.ip);
+                req.session.success = `Request has been ${newStatus.toLowerCase()}.`;
+                res.redirect('/admin/requests');
+            });
         }
-
-        db.run('UPDATE purchase_requests SET status = ?, reviewed_by_id = ?, review_date = CURRENT_TIMESTAMP WHERE id = ?', 
-            [status, req.session.user.id, id], (err) => {
-            if(err) {
-                req.session.error = "Failed to update request.";
-                return res.redirect('/admin/requests');
-            }
-            logAction(req.session.user, `Purchase Request ${status}`, null, `Request for: ${request.item_name}`, req.ip);
-
-            if (status === 'Approved') {
-                const itemSql = `INSERT INTO items (name, category, manufacturer) VALUES (?, ?, ?)`;
-                db.run(itemSql, [request.item_name, 'Requested', 'N/A'], function(err) {
-                     if(err) {
-                        req.session.error = "Request approved, but failed to auto-add item.";
-                     } else {
-                        req.session.success = `Request approved and item "${request.item_name}" has been added to inventory.`;
-                     }
-                     res.redirect('/admin/requests');
-                });
-            } else {
-                 req.session.success = "Request has been denied.";
-                 res.redirect('/admin/requests');
-            }
-        });
     });
 });
 
+app.get('/admin/all-reservations', requireRole(['admin', 'manager']), (req, res) => {
+    const sql = `
+        SELECT r.*, i.name as item_name, u.name as user_name 
+        FROM reservations r
+        JOIN items i ON r.item_id = i.id
+        JOIN users u ON r.user_id = u.id
+        ORDER BY r.start_date DESC
+    `;
+    db.all(sql, [], (err, all_reservations) => {
+        const reservationsHtml = all_reservations.map(r => `
+             <tr class="border-b">
+                <td class="p-2">${r.item_name}</td>
+                <td class="p-2">${r.user_name}</td>
+                <td class="p-2">${r.start_date}</td>
+                <td class="p-2">${r.end_date}</td>
+                <td class="p-2">${r.status}</td>
+                <td class="p-2">
+                    <form action="/reservations/cancel/${r.id}" method="POST" onsubmit="return confirm('Are you sure you want to cancel this reservation?');">
+                        <button type="submit" class="btn btn-danger text-sm">Cancel</button>
+                    </form>
+                </td>
+            </tr>
+        `).join('');
+
+        const content = `
+        <div class="card">
+            <table class="w-full text-left">
+                <thead><tr class="border-b-2">
+                    <th class="p-2">Item</th>
+                    <th class="p-2">User</th>
+                    <th class="p-2">Start Date</th>
+                    <th class="p-2">End Date</th>
+                    <th class="p-2">Status</th>
+                    <th class="p-2">Actions</th>
+                </tr></thead>
+                <tbody>${all_reservations.length > 0 ? reservationsHtml : '<tr><td colspan="6" class="text-center p-4">No reservations found.</td></tr>'}</tbody>
+            </table>
+        </div>`;
+        res.send(renderPage(req, 'All Reservations', req.session.user, content));
+    });
+});
+
+app.get('/admin/extensions', requireRole(['admin', 'manager']), (req, res) => {
+    const sql = `
+        SELECT r.*, u.name as user_name, i.name as item_name
+        FROM reservations r
+        JOIN users u ON r.user_id = u.id
+        JOIN items i ON r.item_id = i.id
+        WHERE r.extension_status = 'Pending'
+        ORDER BY r.start_date
+    `;
+    db.all(sql, (err, requests) => {
+        const requestsHtml = requests.map(r => `
+            <tr class="border-b">
+                <td class="p-2">${r.item_name}</td>
+                <td class="p-2">${r.user_name}</td>
+                <td class="p-2">${r.end_date}</td>
+                <td class="p-2 font-bold text-sky-700">${r.requested_end_date}</td>
+                <td class="p-2">${r.extension_reason || 'N/A'}</td>
+                <td class="p-2">
+                    <div class="flex gap-2">
+                        <form action="/admin/extensions/approve/${r.id}" method="POST">
+                             <button type="submit" class="btn btn-primary text-sm">Approve</button>
+                        </form>
+                         <form action="/admin/extensions/deny/${r.id}" method="POST">
+                             <button type="submit" class="btn btn-danger text-sm">Deny</button>
+                        </form>
+                    </div>
+                </td>
+            </tr>
+        `).join('');
+
+        const content = `
+            <div class="card">
+                <table class="w-full text-left">
+                    <thead><tr class="border-b-2">
+                        <th class="p-2">Item</th>
+                        <th class="p-2">User</th>
+                        <th class="p-2">Current End Date</th>
+                        <th class="p-2">Requested End Date</th>
+                        <th class="p-2">Reason</th>
+                        <th class="p-2">Actions</th>
+                    </tr></thead>
+                    <tbody>${requests.length > 0 ? requestsHtml : '<tr><td colspan="6" class="text-center p-4">No pending extension requests.</td></tr>'}</tbody>
+                </table>
+            </div>
+        `;
+        res.send(renderPage(req, 'Extension Requests', req.session.user, content));
+    });
+});
+
+app.post('/admin/extensions/:action/:id', requireRole(['admin', 'manager']), (req, res) => {
+    const { action, id } = req.params;
+
+    db.get("SELECT * FROM reservations WHERE id = ?", [id], (err, reservation) => {
+        if (err || !reservation) {
+            req.session.error = "Reservation not found.";
+            return res.redirect('/admin/extensions');
+        }
+
+        if (action === 'approve') {
+            const conflictSql = `SELECT id FROM reservations WHERE item_id = ? AND id != ? AND status = 'Active' AND (
+                (start_date <= ? AND end_date >= ?) OR (start_date BETWEEN ? AND ?)
+            )`;
+            db.get(conflictSql, [reservation.item_id, id, reservation.end_date, reservation.end_date, reservation.requested_end_date], (err, conflict) => {
+                if (conflict) {
+                    req.session.error = `Cannot approve extension. Item is already booked by someone else during the requested extension period.`;
+                    return res.redirect('/admin/extensions');
+                }
+
+                const updateSql = "UPDATE reservations SET end_date = ?, extension_status = 'Approved' WHERE id = ?";
+                db.run(updateSql, [reservation.requested_end_date, id], (err) => {
+                    if (err) req.session.error = "Failed to approve extension.";
+                    else {
+                        req.session.success = "Extension approved.";
+                        logAction(req.session.user, 'Approved Extension', null, `Reservation ID: ${id}`, req.ip);
+                    }
+                    res.redirect('/admin/extensions');
+                });
+            });
+        } else { // Deny
+            const updateSql = "UPDATE reservations SET extension_status = 'Denied' WHERE id = ?";
+            db.run(updateSql, [id], (err) => {
+                if (err) req.session.error = "Failed to deny extension.";
+                else {
+                    req.session.success = "Extension denied.";
+                    logAction(req.session.user, 'Denied Extension', null, `Reservation ID: ${id}`, req.ip);
+                }
+                res.redirect('/admin/extensions');
+            });
+        }
+    });
+});
 
 app.get('/admin/password-resets', requireRole(['admin']), (req, res) => {
     const sql = `
@@ -1695,7 +2471,7 @@ app.post('/admin/password-resets/:id', requireRole(['admin']), (req, res) => {
     const { new_password } = req.body;
     const resetId = req.params.id;
     db.get('SELECT user_id FROM password_resets WHERE id = ?', [resetId], (err, reset) => {
-        if(err || !reset) {
+        if (err || !reset) {
             req.session.error = "Reset request not found.";
             return res.redirect('/admin/password-resets');
         }
@@ -1707,6 +2483,190 @@ app.post('/admin/password-resets/:id', requireRole(['admin']), (req, res) => {
                 res.redirect('/admin/password-resets');
             });
         });
+    });
+});
+
+// --- Admin: User Management ---
+app.get('/users', requireRole(['admin']), (req, res) => {
+    db.all("SELECT * FROM users", (err, users) => {
+        const usersHtml = users.map(u => {
+            let statusBadge = '';
+            switch (u.status) {
+                case 'active': statusBadge = '<span class="bg-green-100 text-green-800 text-xs font-medium px-2.5 py-0.5 rounded-full">Active</span>'; break;
+                case 'timed_out': statusBadge = `<span class="bg-yellow-100 text-yellow-800 text-xs font-medium px-2.5 py-0.5 rounded-full">Timed Out</span>`; break;
+                case 'banned': statusBadge = '<span class="bg-red-100 text-red-800 text-xs font-medium px-2.5 py-0.5 rounded-full">Banned</span>'; break;
+            }
+            let actions = `<a href="/profile/${u.id}" class="text-sky-600 hover:underline">Details</a>`;
+
+            return `
+             <tr class="border-b">
+                <td class="py-2 px-4">${u.name}</td>
+                <td class="py-2 px-4">${u.student_id}</td>
+                <td class="py-2 px-4 capitalize">${u.role}</td>
+                <td class="py-2 px-4">${statusBadge}</td>
+                <td class="py-2 px-4">${actions}</td>
+            </tr>
+            `;
+        }).join('');
+
+        const content = `
+        <div class="card">
+             <h2 class="text-xl font-bold mb-4">User Accounts</h2>
+             <div class="overflow-x-auto">
+                 <table class="w-full text-left">
+                     <thead><tr class="border-b-2">
+                         <th class="py-2 px-4">Name</th><th class="py-2 px-4">Student ID</th><th class="py-2 px-4">Role</th><th class="py-2 px-4">Status</th><th class="py-2 px-4">Actions</th>
+                     </tr></thead>
+                     <tbody>${usersHtml}</tbody>
+                 </table>
+             </div>
+        </div>
+        `;
+        res.send(renderPage(req, 'User Management', req.session.user, content));
+    });
+});
+
+
+app.post('/users/update-role/:id', requireRole(['admin']), (req, res) => {
+    const userId = req.params.id;
+    const { role } = req.body;
+    if (!['user', 'manager'].includes(role)) {
+        req.session.error = "Invalid role selected.";
+        return res.redirect(`/profile/${userId}`);
+    }
+
+    db.get("SELECT role, name FROM users WHERE id = ?", [userId], (err, userToUpdate) => {
+        if (err || !userToUpdate) {
+            req.session.error = "User not found.";
+            return res.redirect('/users');
+        }
+        if (userToUpdate.role === 'admin') {
+            req.session.error = "Cannot change the role of an administrator.";
+            return res.redirect('/users');
+        }
+        db.run("UPDATE users SET role = ? WHERE id = ?", [role, userId], function (err) {
+            if (err) {
+                req.session.error = "Failed to update user role.";
+            } else {
+                logAction(req.session.user, 'Updated User Role', null, `Set user ${userToUpdate.name} to ${role}`, req.ip);
+                req.session.success = "User role updated successfully.";
+            }
+            res.redirect(`/profile/${userId}`);
+        });
+    });
+});
+
+app.post('/users/timeout/:id', requireRole(['admin']), (req, res) => {
+    const userId = req.params.id;
+    const durationHours = parseInt(req.body.duration, 10) || 24;
+    const timeoutUntil = new Date();
+    timeoutUntil.setHours(timeoutUntil.getHours() + durationHours);
+
+    db.run("UPDATE users SET status = 'timed_out', timeout_until = ? WHERE id = ? AND role != 'admin'", [timeoutUntil, userId], function (err) {
+        if (err || this.changes === 0) { req.session.error = "Failed to time out user (user might be an admin)."; }
+        else {
+            logAction(req.session.user, 'Timed Out User', null, `User ID: ${userId} for ${durationHours} hours.`, req.ip);
+            req.session.success = "User has been placed in timeout.";
+        }
+        res.redirect(`/profile/${userId}`);
+    });
+});
+
+app.post('/users/ban/:id', requireRole(['admin']), (req, res) => {
+    const userId = req.params.id;
+    db.run("UPDATE users SET status = 'banned' WHERE id = ? AND role != 'admin'", [userId], function (err) {
+        if (err || this.changes === 0) { req.session.error = "Failed to ban user (user might be an admin)."; }
+        else {
+            logAction(req.session.user, 'Banned User', null, `User ID: ${userId}`, req.ip);
+            req.session.success = "User has been banned.";
+        }
+        res.redirect(`/profile/${userId}`);
+    });
+});
+
+app.post('/users/reactivate/:id', requireRole(['admin']), (req, res) => {
+    const userId = req.params.id;
+    db.run("UPDATE users SET status = 'active', timeout_until = NULL WHERE id = ?", [userId], function (err) {
+        if (err) { req.session.error = "Failed to reactivate user."; }
+        else {
+            logAction(req.session.user, 'Reactivated User', null, `User ID: ${userId}`, req.ip);
+            req.session.success = "User has been reactivated.";
+        }
+        res.redirect(`/profile/${userId}`);
+    });
+});
+
+app.post('/users/delete/:id', requireRole(['admin']), (req, res) => {
+    const userIdToDelete = req.params.id;
+    const adminUserId = req.session.user.id;
+
+    if (userIdToDelete == adminUserId) {
+        req.session.error = "You cannot delete your own account.";
+        return res.redirect('/users');
+    }
+
+    db.get('SELECT * FROM users WHERE id = ?', [userIdToDelete], (err, user) => {
+        if (err || !user) {
+            req.session.error = "User not found.";
+            return res.redirect('/users');
+        }
+        if (user.role === 'admin') {
+            req.session.error = "Administrators cannot be deleted.";
+            return res.redirect(`/profile/${userIdToDelete}`);
+        }
+        db.get('SELECT id, name FROM items WHERE checked_out_by_id = ?', [userIdToDelete], (err, item) => {
+            if (err) {
+                req.session.error = "Database error while checking for checked-out items.";
+                return res.redirect(`/profile/${userIdToDelete}`);
+            }
+            if (item) {
+                req.session.error = `Cannot delete user. They still have item "${item.name}" checked out. Please check in all items first.`;
+                return res.redirect(`/profile/${userIdToDelete}`);
+            }
+
+            db.run('DELETE FROM users WHERE id = ?', [userIdToDelete], function (err) {
+                if (err) {
+                    req.session.error = `Failed to delete user. Error: ${err.message}`;
+                    return res.redirect(`/profile/${userIdToDelete}`);
+                }
+                logAction(req.session.user, 'Deleted User', null, `Deleted user: ${user.name} (ID: ${userIdToDelete})`, req.ip);
+                req.session.success = `User "${user.name}" has been permanently deleted.`;
+                res.redirect('/users');
+            });
+        });
+    });
+});
+
+app.get('/request-password-reset', (req, res) => {
+    const content = `<div class="card max-w-md mx-auto">
+        <h2 class="text-xl font-bold mb-4">Request Password Reset</h2>
+        <p class="mb-4">Enter your Student ID. If it exists, an admin will be notified to reset your password.</p>
+        <form action="/request-password-reset" method="POST">
+             <div class="mb-4">
+                <label class="block text-gray-700">Student ID</label>
+                <input type="text" name="student_id" class="w-full p-2 border rounded" required>
+            </div>
+            <button type="submit" class="btn btn-primary w-full">Submit Request</button>
+            <div class="text-center mt-4">
+                <a href="/login" class="text-sm text-sky-600 hover:underline">Back to Login</a>
+            </div>
+        </form>
+    </div>`;
+    res.send(renderPage(req, 'Password Reset', null, content));
+});
+
+app.post('/request-password-reset', (req, res) => {
+    const { student_id } = req.body;
+    db.get('SELECT id FROM users WHERE student_id = ?', [student_id], (err, user) => {
+        if (user) {
+            db.get('SELECT id FROM password_resets WHERE user_id = ? AND status = ?', [user.id, 'Pending'], (err, existing) => {
+                if (!existing) {
+                    db.run('INSERT INTO password_resets (user_id, status) VALUES (?, ?)', [user.id, 'Pending']);
+                }
+            });
+        }
+        req.session.success = "If your account exists, a password reset request has been sent to the administrator.";
+        res.redirect('/login');
     });
 });
 
@@ -1722,11 +2682,11 @@ app.get('/locations', requireRole(['admin', 'manager']), (req, res) => {
             <div class="card">
                  <h2 class="text-xl font-bold mb-4">Add New Location</h2>
                  <form action="/locations" method="POST">
-                    <div class="mb-4">
-                        <label class="block">Location Name (e.g., Cabinet A, Shelf B-2)</label>
-                        <input type="text" name="name" class="w-full p-2 border rounded" required>
-                    </div>
-                    <button type="submit" class="btn btn-primary">Add Location</button>
+                     <div class="mb-4">
+                         <label class="block">Location Name (e.g., Cabinet A, Shelf B-2)</label>
+                         <input type="text" name="name" class="w-full p-2 border rounded" required>
+                     </div>
+                     <button type="submit" class="btn btn-primary">Add Location</button>
                  </form>
             </div>
         </div>`;
@@ -1736,8 +2696,8 @@ app.get('/locations', requireRole(['admin', 'manager']), (req, res) => {
 
 app.post('/locations', requireRole(['admin', 'manager']), (req, res) => {
     const { name } = req.body;
-    db.run('INSERT INTO locations (name) VALUES (?)', [name], function(err) {
-        if(err) {
+    db.run('INSERT INTO locations (name) VALUES (?)', [name], function (err) {
+        if (err) {
             req.session.error = "Failed to add location. It may already exist.";
         } else {
             req.session.success = "Location added successfully.";
@@ -1760,6 +2720,7 @@ app.get('/audit-log', requireRole(['admin']), (req, res) => {
             </tr>
         `).join('');
         const content = `<div class="card">
+            <div class="overflow-x-auto">
             <table class="w-full text-left">
                 <thead><tr class="border-b-2">
                     <th class="py-2 px-4">Timestamp</th>
@@ -1771,6 +2732,7 @@ app.get('/audit-log', requireRole(['admin']), (req, res) => {
                 </tr></thead>
                 <tbody>${logsHtml}</tbody>
             </table>
+            </div>
         </div>`;
         res.send(renderPage(req, 'Audit Log', req.session.user, content));
     });
@@ -1813,22 +2775,24 @@ app.post('/data/import', requireRole(['admin']), upload.single('csvFile'), (req,
         })
         .on('data', row => items.push(row))
         .on('end', rowCount => {
-            const sql = `INSERT INTO items (name, category, model_number, serial_number, manufacturer, condition, quantity) VALUES (?, ?, ?, ?, ?, ?, ?)`;
-            let successCount = 0;
-            let errorCount = 0;
-            
+            const sql = `INSERT INTO items (name, category, model_number, serial_number, manufacturer, condition, quantity, last_activity_date) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`;
+
             db.serialize(() => {
+                db.run('BEGIN TRANSACTION');
                 const stmt = db.prepare(sql);
                 items.forEach(item => {
-                    stmt.run([item.name, item.category, item.model_number, item.serial_number, item.manufacturer, item.condition, item.quantity], (err) => {
-                        if (err) errorCount++;
-                        else successCount++;
-                    });
+                    stmt.run([item.name, item.category, item.model_number, item.serial_number, item.manufacturer, item.condition, item.quantity]);
                 });
-                stmt.finalize((err) => {
-                    logAction(req.session.user, 'Imported Data', null, `Imported ${successCount} items from CSV. ${errorCount} errors.`, req.ip);
-                    req.session.success = `Successfully imported ${successCount} items. Failed to import ${errorCount} items (likely duplicate serial numbers).`;
-                    fs.unlinkSync(req.file.path); // Clean up uploaded file
+                stmt.finalize();
+                db.run('COMMIT', (err) => {
+                    if (err) {
+                        db.run('ROLLBACK');
+                        req.session.error = `Transaction failed: ${err.message}. No items were imported.`;
+                    } else {
+                        logAction(req.session.user, 'Imported Data', null, `Imported ${rowCount} items from CSV.`, req.ip);
+                        req.session.success = `Successfully processed ${rowCount} items from CSV.`;
+                    }
+                    fs.unlinkSync(req.file.path);
                     res.redirect('/inventory');
                 });
             });
@@ -1847,12 +2811,279 @@ app.get('/data/export/:type', requireRole(['admin']), (req, res) => {
     csvStream.pipe(res);
 
     db.each(`SELECT * FROM ${table}`, (err, row) => {
-        if(err) { console.error(err); }
+        if (err) { console.error(err); }
         else { csvStream.write(row); }
     }, () => {
         csvStream.end();
         logAction(req.session.user, 'Exported Data', null, `Exported ${type} to CSV.`, req.ip);
     });
+});
+
+// --- New User Profile and Item Routes (Moved before 404 handler) ---
+app.get('/profile/:id?', requireLogin, (req, res) => {
+    const profileId = req.params.id || req.session.user.id;
+
+    // Admin can view any profile, users can only view their own
+    if (req.session.user.role !== 'admin' && profileId != req.session.user.id) {
+        req.session.error = "You are not authorized to view this profile.";
+        return res.redirect('/dashboard');
+    }
+
+    db.get("SELECT * FROM users WHERE id = ?", [profileId], (err, user) => {
+        if (err || !user) {
+            req.session.error = "User not found.";
+            return res.redirect('/users');
+        }
+
+        db.all("SELECT * FROM audit_log WHERE user_id = ? ORDER BY timestamp DESC LIMIT 50", [profileId], (err, logs) => {
+            const sql = `
+                SELECT id, name, image_url, last_activity_date as checkout_date
+                FROM items
+                WHERE checked_out_by_id = ?
+                ORDER BY last_activity_date DESC
+            `;
+            db.all(sql, [profileId], (err, checked_out_items) => {
+
+                let moderationForm = '';
+                let roleManagementForm = '';
+                if (req.session.user.role === 'admin' && user.role !== 'admin') {
+                    if (user.status === 'active') {
+                        moderationForm = `
+                            <form action="/users/timeout/${user.id}" method="POST" class="mb-2">
+                                <label>Duration (hours)</label>
+                                <input type="number" name="duration" value="24" class="p-1 border rounded">
+                                <button type="submit" class="btn btn-warning">Timeout</button>
+                            </form>
+                            <form action="/users/ban/${user.id}" method="POST" onsubmit="return confirm('Ban this user? This is permanent.')">
+                                <button type="submit" class="btn btn-danger">Ban</button>
+                            </form>
+                        `;
+                    } else {
+                        moderationForm = `<form action="/users/reactivate/${user.id}" method="POST"><button type="submit" class="btn btn-primary">Reactivate</button></form>`;
+                    }
+                    roleManagementForm = `
+                        <div class="card mt-6">
+                            <h2 class="text-xl font-bold mb-4">Change Role</h2>
+                            <form action="/users/update-role/${user.id}" method="POST">
+                                <select name="role" class="w-full p-2 border rounded mb-2">
+                                    <option value="user" ${user.role === 'user' ? 'selected' : ''}>User</option>
+                                    <option value="manager" ${user.role === 'manager' ? 'selected' : ''}>Manager</option>
+                                </select>
+                                <button type="submit" class="btn btn-primary w-full">Set Role</button>
+                            </form>
+                        </div>
+                    `;
+                }
+
+                const content = `
+                <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                    <div class="lg:col-span-2">
+                        <div class="card">
+                            <h2 class="text-xl font-bold mb-4">Recent Activity</h2>
+                            <ul class="divide-y">${logs.map(l => `
+                                <li class="py-2"><p>${l.action} ${l.item_name ? `(<a href="/inventory/view/${l.item_id}" class="text-sky-600">${l.item_name}</a>)` : ''} - <span class="text-gray-500">${new Date(l.timestamp).toLocaleString()}</span></p></li>
+                            `).join('') || '<p>No activity logged.</p>'}</ul>
+                        </div>
+                        <div class="card mt-6">
+                            <h2 class="text-xl font-bold mb-4">Currently Checked-Out Items</h2>
+                            <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4">${checked_out_items.map(i => `
+                                <a href="/inventory/view/${i.id}" class="border rounded-lg p-2 hover:shadow-lg transition-shadow">
+                                     <img src="${i.image_url || '/uploads/images/placeholder.png'}" alt="${i.name}" class="w-full h-24 object-cover rounded-md mb-2">
+                                     <p class="font-semibold text-center">${i.name}</p>
+                                </a>
+                            `).join('') || '<p>No items currently checked out.</p>'}</div>
+                        </div>
+                    </div>
+                    <div>
+                        <div class="card">
+                             <h2 class="text-xl font-bold mb-4">User Details</h2>
+                             <p><strong>Name:</strong> ${user.name}</p>
+                             <p><strong>Student ID:</strong> ${user.student_id}</p>
+                             <p><strong>Role:</strong> ${user.role}</p>
+                             <p><strong>Status:</strong> ${user.status}</p>
+                             ${user.status === 'timed_out' ? `<p><strong>Timeout Ends:</strong> ${new Date(user.timeout_until).toLocaleString()}</p>` : ''}
+                        </div>
+                        ${(req.session.user.id == user.id) ? `
+                         <div class="card mt-6">
+                             <h2 class="text-xl font-bold mb-4">Edit Your Info</h2>
+                             <form action="/profile/edit" method="POST">
+                                <label>Name</label>
+                                <input type="text" name="name" value="${user.name}" class="w-full p-2 border rounded mb-2">
+                                <button type="submit" class="btn btn-primary">Save</button>
+                             </form>
+                         </div>
+                        ` : ''}
+                         ${req.session.user.role === 'admin' ? `
+                         <div class="card mt-6">
+                            <h2 class="text-xl font-bold mb-4">Admin Moderation</h2>
+                            ${moderationForm}
+                         </div>
+                         ${roleManagementForm}
+                         `: ''}
+                    </div>
+                </div>
+                `;
+                res.send(renderPage(req, `Profile: ${user.name}`, req.session.user, content));
+            });
+        });
+    });
+});
+
+app.post('/profile/edit', requireLogin, (req, res) => {
+    const { name } = req.body;
+    db.run("UPDATE users SET name = ? WHERE id = ?", [name, req.session.user.id], function (err) {
+        if (err) {
+            req.session.error = "Failed to update your name.";
+        } else {
+            req.session.success = "Your name has been updated.";
+            req.session.user.name = name; // Update session
+        }
+        res.redirect('/profile');
+    });
+});
+
+app.get('/my-items', requireLogin, (req, res) => {
+    const sql = `
+        SELECT id, name, image_url, last_activity_date as checkout_date
+        FROM items
+        WHERE checked_out_by_id = ?
+        ORDER BY last_activity_date DESC
+    `;
+    db.all(sql, [req.session.user.id], (err, items) => {
+        const content = `
+            <div class="card">
+                <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4">
+                    ${items.length > 0 ? items.map(item => `
+                         <div class="border rounded-lg p-4 text-center">
+                            <a href="/inventory/view/${item.id}">
+                                <img src="${item.image_url || '/uploads/images/placeholder.png'}" alt="${item.name}" class="w-full h-32 object-cover rounded-md mb-2">
+                                <h3 class="font-semibold">${item.name}</h3>
+                                <p class="text-sm text-gray-500">Checked out on ${new Date(item.checkout_date).toLocaleDateString()}</p>
+                            </a>
+                             <form action="/inventory/checkin/${item.id}" method="POST" class="mt-2">
+                                <button type="submit" class="btn btn-secondary w-full">Check In</button>
+                             </form>
+                         </div>
+                    `).join('') : '<p class="col-span-full text-center">You have no items checked out.</p>'}
+                </div>
+            </div>
+        `;
+        res.send(renderPage(req, 'My Checked-Out Items', req.session.user, content));
+    });
+});
+
+// --- Project Routes ---
+app.get('/projects', requireLogin, (req, res) => {
+    db.all("SELECT p.*, u.name as creator_name FROM projects p LEFT JOIN users u ON p.created_by_id = u.id ORDER BY created_at DESC", (err, projects) => {
+        const content = `
+            <div class="flex justify-end mb-4">
+                <a href="/projects/new" class="btn btn-primary">Create New Project</a>
+            </div>
+            <div class="card">
+                <ul class="divide-y">
+                    ${projects.length > 0 ? projects.map(p => `
+                        <li class="p-4 hover:bg-gray-50">
+                            <a href="/projects/${p.id}" class="block">
+                                <h3 class="text-xl font-bold text-sky-700">${p.name}</h3>
+                                <p class="text-gray-600">${p.description || 'No description.'}</p>
+                                <p class="text-sm text-gray-400">Created by ${p.creator_name || 'N/A'} on ${new Date(p.created_at).toLocaleDateString()}</p>
+                            </a>
+                        </li>
+                    `).join('') : '<p>No projects yet. Create one to get started!</p>'}
+                </ul>
+            </div>
+        `;
+        res.send(renderPage(req, 'Projects', req.session.user, content));
+    });
+});
+
+app.get('/projects/new', requireLogin, (req, res) => {
+    const content = `
+        <div class="card max-w-2xl mx-auto">
+            <form action="/projects/new" method="POST">
+                <div class="mb-4">
+                    <label class="block font-bold">Project Name</label>
+                    <input type="text" name="name" class="w-full p-2 border rounded" required>
+                </div>
+                <div class="mb-4">
+                    <label class="block font-bold">Description</label>
+                    <textarea name="description" class="w-full p-2 border rounded"></textarea>
+                </div>
+                <button type="submit" class="btn btn-primary">Create Project</button>
+            </form>
+        </div>
+    `;
+    res.send(renderPage(req, 'Create New Project', req.session.user, content));
+});
+
+app.post('/projects/new', requireLogin, (req, res) => {
+    const { name, description } = req.body;
+    const sql = "INSERT INTO projects (name, description, created_by_id) VALUES (?, ?, ?)";
+    db.run(sql, [name, description, req.session.user.id], function (err) {
+        if (err) {
+            req.session.error = "Failed to create project.";
+            res.redirect('/projects/new');
+        } else {
+            req.session.success = "Project created.";
+            logAction(req.session.user, 'Created Project', null, `Name: ${name}`, req.ip);
+            res.redirect(`/projects/${this.lastID}`);
+        }
+    });
+});
+
+app.get('/projects/:id', requireLogin, (req, res) => {
+    const projectId = req.params.id;
+    db.get("SELECT * FROM projects WHERE id = ?", [projectId], (err, project) => {
+        if (!project) return res.redirect('/projects');
+
+        const sql = `
+            SELECT i.id, i.name, i.image_url, u.name as user_name, pc.checkout_date
+            FROM items i 
+            JOIN project_checkouts pc ON i.id = pc.item_id
+            JOIN users u ON pc.user_id = u.id
+            WHERE pc.project_id = ?
+            GROUP BY i.id
+        `;
+        db.all(sql, [projectId], (err, items) => {
+            db.all("SELECT id, name FROM items WHERE status = 'Available' AND is_consumable = 0", (err, availableItems) => {
+                const content = `
+                    <p class="mb-4">${project.description}</p>
+                    <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+                        <div class="md:col-span-2 card">
+                             <h2 class="text-xl font-bold mb-4">Items for this Project</h2>
+                             <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                                ${items.length > 0 ? items.map(item => `
+                                <div class="border rounded-lg p-2 text-center">
+                                    <a href="/inventory/view/${item.id}"><img src="${item.image_url || '/uploads/images/placeholder.png'}" class="w-full h-24 object-cover rounded-md mb-2">
+                                    <p class="font-semibold">${item.name}</p></a>
+                                    <p class="text-sm text-gray-500">w/ ${item.user_name}</p>
+                                </div>`).join('') : '<p>No items checked out for this project yet.</p>'}
+                             </div>
+                        </div>
+                        <div class="card">
+                            <h2 class="text-xl font-bold mb-4">Check Out Item for Project</h2>
+                            <form action="/projects/add-item/${projectId}" method="POST">
+                                <select name="item_id" class="w-full p-2 border rounded mb-2">
+                                    ${availableItems.map(i => `<option value="${i.id}">${i.name}</option>`).join('')}
+                                </select>
+                                <button type="submit" class="btn btn-primary w-full">Add to Project</button>
+                            </form>
+                        </div>
+                    </div>
+                `;
+                res.send(renderPage(req, `Project: ${project.name}`, req.session.user, content));
+            });
+        });
+    });
+});
+
+app.post('/projects/add-item/:id', requireLogin, (req, res) => {
+    const projectId = req.params.id;
+    const { item_id } = req.body;
+
+    // This is a shortcut that uses the standard checkout logic but passes the project ID
+    req.body.project_id = projectId;
+    return app._router.handle({ method: 'POST', url: `/inventory/checkout/${item_id}`, body: req.body, session: req.session, ip: req.ip }, res);
 });
 
 
