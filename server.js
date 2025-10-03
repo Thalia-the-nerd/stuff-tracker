@@ -52,7 +52,6 @@ fs.mkdirSync(CSV_PATH, { recursive: true });
 
 // For accurate IP address tracking behind a proxy
 app.set('trust proxy', 1);
-
 // 2. MULTER CONFIGURATION (for file uploads)
 const storage = multer.diskStorage({
     destination: (req, file, cb) => {
@@ -1385,7 +1384,489 @@ app.get('/inventory/edit/:id', requireRole(['admin', 'manager']), (req, res) => 
                                             <label class="block">Low Stock Alert Threshold</label>
                                             <input type="number" name="low_stock_threshold" placeholder="e.g., 10" class="w-full p-2 border rounded" value="${item.low_stock_threshold || ''}">
                                         </div>
-                                        ${kitManagementHtml}
+                                        ${k
+});
+
+app.post('/inventory/edit/:id', requireRole(['admin', 'manager']), upload.single('itemImage'), (req, res) => {
+    const itemId = req.params.id;
+    const { name, quantity, model_number, serial_number, manufacturer, category, condition, specifications, location_id, comment, low_stock_threshold } = req.body;
+    const is_kit = req.body.is_kit ? 1 : 0;
+    const is_consumable = req.body.is_consumable ? 1 : 0;
+    const finalSerialNumber = serial_number && serial_number.trim() !== '' ? serial_number.trim() : null;
+
+    let imageUrlSql = '';
+    let imageUrlParams = [];
+    if (req.file) {
+        imageUrlSql = ', image_url = ?';
+        imageUrlParams.push(`/uploads/images/${req.file.filename}`);
+    }
+
+    const sql = `UPDATE items SET 
+        name = ?, quantity = ?, model_number = ?, serial_number = ?, manufacturer = ?, 
+        category = ?, condition = ?, specifications = ?, location_id = ?, comment = ?, is_kit = ?,
+        is_consumable = ?, low_stock_threshold = ?
+        ${imageUrlSql} 
+        WHERE id = ?`;
+
+    const params = [name, quantity, model_number, finalSerialNumber, manufacturer, category, condition, specifications, location_id, comment, is_kit, is_consumable, low_stock_threshold, ...imageUrlParams, itemId];
+
+    db.run(sql, params, function (err) {
+        if (err) {
+            req.session.error = `Failed to update item. Error: ${err.message}`;
+        } else {
+            if (!is_kit) {
+                // If it's no longer a kit, remove all component associations
+                db.run('DELETE FROM kits WHERE kit_id = ?', [itemId]);
+            }
+            logAction(req.session.user, 'Updated Item', { id: itemId, name: name }, '', req.ip);
+            req.session.success = "Item updated successfully.";
+        }
+        res.redirect(`/inventory/view/${itemId}`);
+    });
+});
+
+app.post('/inventory/archive/:id', requireRole(['admin', 'manager']), (req, res) => {
+    const itemId = req.params.id;
+    db.run("UPDATE items SET status = 'Archived' WHERE id = ?", [itemId], function (err) {
+        if (err) {
+            req.session.error = "Failed to archive item.";
+        } else {
+            logAction(req.session.user, 'Archived Item', { id: itemId }, '', req.ip);
+            req.session.success = "Item archived successfully.";
+        }
+        res.redirect(req.get('referer') || `/inventory/view/${itemId}`);
+    });
+});
+
+app.post('/inventory/unarchive/:id', requireRole(['admin', 'manager']), (req, res) => {
+    const itemId = req.params.id;
+    // When un-archiving, set to available. User can change it later if needed.
+    db.run("UPDATE items SET status = 'Available' WHERE id = ?", [itemId], function (err) {
+        if (err) {
+            req.session.error = "Failed to un-archive item.";
+        } else {
+            logAction(req.session.user, 'Un-Archived Item', { id: itemId }, '', req.ip);
+            req.session.success = "Item restored successfully.";
+        }
+        res.redirect(req.get('referer') || `/inventory/view/${itemId}`);
+    });
+});
+
+
+app.post('/inventory/delete/:id', requireRole(['admin']), (req, res) => {
+    const itemId = req.params.id;
+    db.get('SELECT name, image_url FROM items WHERE id = ?', [itemId], (err, item) => {
+        if (err || !item) {
+            req.session.error = "Item not found.";
+            return res.redirect('/inventory');
+        }
+        db.run('DELETE FROM items WHERE id = ?', [itemId], function (err) {
+            if (err) {
+                req.session.error = `Failed to delete item. Error: ${err.message}`;
+                res.redirect(`/inventory/view/${itemId}`);
+            } else {
+                if (item.image_url) {
+                    fs.unlink(path.join(__dirname, item.image_url), (unlinkErr) => {
+                        if (unlinkErr) console.error("Error deleting image file:", unlinkErr);
+                    });
+                }
+                logAction(req.session.user, 'Deleted Item', { id: itemId, name: item.name }, 'Item permanently deleted.', req.ip);
+                req.session.success = `Item "${item.name}" has been permanently deleted.`;
+                res.redirect('/inventory');
+            }
+        });
+    });
+});
+
+// Kit and Related Items Management
+app.post('/inventory/kit/add/:kitId', requireRole(['admin', 'manager']), (req, res) => {
+    const { kitId } = req.params;
+    const { item_id } = req.body;
+    db.run('INSERT INTO kits (kit_id, item_id) VALUES (?, ?)', [kitId, item_id], function (err) {
+        if (err) {
+            req.session.error = "Failed to add component. It might already be in the kit.";
+        } else {
+            logAction(req.session.user, 'Added Kit Component', { id: kitId }, `Added item ID ${item_id}`, req.ip);
+            req.session.success = "Component added to kit.";
+        }
+        res.redirect(`/inventory/edit/${kitId}`);
+    });
+});
+
+app.post('/inventory/kit/remove/:kitId/:itemId', requireRole(['admin', 'manager']), (req, res) => {
+    const { kitId, itemId } = req.params;
+    db.run('DELETE FROM kits WHERE kit_id = ? AND item_id = ?', [kitId, itemId], function (err) {
+        if (err) {
+            req.session.error = "Failed to remove component.";
+        } else {
+            logAction(req.session.user, 'Removed Kit Component', { id: kitId }, `Removed item ID ${itemId}`, req.ip);
+            req.session.success = "Component removed from kit.";
+        }
+        res.redirect(`/inventory/edit/${kitId}`);
+    });
+});
+
+app.post('/inventory/related/add/:itemId', requireRole(['admin', 'manager']), (req, res) => {
+    const { itemId } = req.params;
+    const { related_item_id } = req.body;
+    // Insert in a consistent order to avoid duplicates (e.g. 1-2 and 2-1)
+    const [item_a_id, item_b_id] = [itemId, related_item_id].sort();
+    db.run('INSERT INTO related_items (item_a_id, item_b_id) VALUES (?, ?)', [item_a_id, item_b_id], function (err) {
+        if (err) {
+            req.session.error = "Failed to add relation. It might already exist.";
+        } else {
+            logAction(req.session.user, 'Added Related Item', { id: itemId }, `Related to item ID ${related_item_id}`, req.ip);
+            req.session.success = "Item relation added.";
+        }
+        res.redirect(`/inventory/edit/${itemId}`);
+    });
+});
+
+app.post('/inventory/related/remove/:itemId/:relatedItemId', requireRole(['admin', 'manager']), (req, res) => {
+    const { itemId, relatedItemId } = req.params;
+    const [item_a_id, item_b_id] = [itemId, relatedItemId].sort();
+    db.run('DELETE FROM related_items WHERE item_a_id = ? AND item_b_id = ?', [item_a_id, item_b_id], function (err) {
+        if (err) {
+            req.session.error = "Failed to remove relation.";
+        } else {
+            logAction(req.session.user, 'Removed Related Item', { id: itemId }, `Removed relation to item ID ${relatedItemId}`, req.ip);
+            req.session.success = "Item relation removed.";
+        }
+        res.redirect(`/inventory/edit/${itemId}`);
+    });
+});
+
+// Check-in / Check-out / Use Logic
+app.post('/inventory/checkout/:id', requireLogin, (req, res) => {
+    const itemId = req.params.id;
+    const userId = req.session.user.id;
+    const { project_id } = req.body; // For project-based checkouts
+
+    db.get('SELECT * FROM items WHERE id = ?', [itemId], (err, item) => {
+        if (err || !item) {
+            req.session.error = "Item not found.";
+            return res.redirect(req.get('referer') || '/inventory');
+        }
+
+        const itemsToCheckOut = [item];
+
+        const processCheckout = () => {
+            db.serialize(() => {
+                db.run('BEGIN TRANSACTION');
+                let hadError = false;
+                itemsToCheckOut.forEach(thing => {
+                    const newQuantityCheckedOut = thing.quantity_checked_out + 1;
+                    const newStatus = newQuantityCheckedOut >= thing.quantity ? 'Checked Out' : 'Available';
+                    db.run('UPDATE items SET quantity_checked_out = ?, status = ?, last_activity_date = CURRENT_TIMESTAMP, checked_out_by_id = ? WHERE id = ?',
+                        [newQuantityCheckedOut, newStatus, userId, thing.id], function (err) {
+                            if (err) hadError = true;
+                        });
+                    // If part of a project, log it
+                    if (project_id) {
+                        db.run('INSERT INTO project_checkouts (project_id, item_id, user_id) VALUES (?, ?, ?)', [project_id, thing.id, userId], (err) => { if (err) hadError = true; });
+                    }
+                });
+                db.run('COMMIT', (err) => {
+                    if (err || hadError) {
+                        db.run('ROLLBACK');
+                        req.session.error = `A database error occurred during checkout.`;
+                    } else {
+                        logAction(req.session.user, item.is_kit ? 'Checked Out Kit' : 'Checked Out Item', item, project_id ? `For project ID ${project_id}` : '', req.ip);
+                        req.session.success = `"${item.name}" checked out successfully.`;
+                    }
+                    res.redirect(req.get('referer') || '/inventory');
+                });
+            });
+        };
+
+        if (item.is_kit) {
+            db.all('SELECT * FROM items i JOIN kits k ON i.id = k.item_id WHERE k.kit_id = ?', [itemId], (err, components) => {
+                const unavailable = components.find(c => c.quantity_checked_out >= c.quantity);
+                if (unavailable) {
+                    req.session.error = `Cannot check out kit. Component "${unavailable.name}" is not available.`;
+                    return res.redirect(req.get('referer') || `/inventory/view/${itemId}`);
+                }
+                itemsToCheckOut.push(...components);
+                processCheckout();
+            });
+        } else {
+            if (item.quantity_checked_out >= item.quantity) {
+                req.session.error = `"${item.name}" is not available for checkout.`;
+                return res.redirect(req.get('referer') || `/inventory/view/${itemId}`);
+            }
+            processCheckout();
+        }
+    });
+});
+
+app.post('/inventory/checkin/:id', requireLogin, (req, res) => {
+    const itemId = req.params.id;
+    const userId = req.session.user.id;
+
+    db.get('SELECT * FROM items WHERE id = ?', [itemId], (err, item) => {
+        if (err || !item) {
+            req.session.error = "Item not found.";
+            return res.redirect(req.get('referer') || '/inventory');
+        }
+
+        const itemsToCheckIn = [item];
+
+        const processCheckin = () => {
+            db.serialize(() => {
+                db.run('BEGIN TRANSACTION');
+                let hadError = false;
+                itemsToCheckIn.forEach(thing => {
+                    const newQuantityCheckedOut = Math.max(0, thing.quantity_checked_out - 1);
+                    const newStatus = 'Available'; // Always becomes available after a check-in
+
+                    let updateSql = 'UPDATE items SET quantity_checked_out = ?, status = ?, last_activity_date = CURRENT_TIMESTAMP WHERE id = ?';
+                    let params = [newQuantityCheckedOut, newStatus, thing.id];
+
+                    if (newQuantityCheckedOut === 0) {
+                        updateSql = 'UPDATE items SET quantity_checked_out = ?, status = ?, last_activity_date = CURRENT_TIMESTAMP, checked_out_by_id = NULL WHERE id = ?';
+                        params = [newQuantityCheckedOut, 'Available', thing.id];
+                    }
+
+                    db.run(updateSql, params, function (err) {
+                        if (err) hadError = true;
+                    });
+                    // Also remove from project checkouts
+                    db.run('DELETE FROM project_checkouts WHERE item_id = ? AND user_id = ?', [thing.id, userId], (err) => { if (err) hadError = true; });
+                });
+                db.run('COMMIT', (err) => {
+                    if (err || hadError) {
+                        db.run('ROLLBACK');
+                        req.session.error = `A database error occurred during check-in.`;
+                    } else {
+                        logAction(req.session.user, item.is_kit ? 'Checked In Kit' : 'Checked In Item', item, '', req.ip);
+                        req.session.success = `"${item.name}" checked in successfully.`;
+                    }
+                    res.redirect(req.get('referer') || '/inventory');
+                });
+            });
+        };
+
+        if (item.quantity_checked_out <= 0) {
+            req.session.error = `Cannot check in "${item.name}". It is already fully checked in.`;
+            return res.redirect(req.get('referer') || `/inventory/view/${itemId}`);
+        }
+
+        if (item.is_kit) {
+            db.all('SELECT * FROM items i JOIN kits k ON i.id = k.item_id WHERE k.kit_id = ?', [itemId], (err, components) => {
+                itemsToCheckIn.push(...components);
+                processCheckin();
+            });
+        } else {
+            processCheckin();
+        }
+    });
+});
+
+app.post('/inventory/use/:id', requireLogin, (req, res) => {
+    const itemId = req.params.id;
+    const quantityUsed = parseInt(req.body.quantity_used, 10);
+
+    db.get('SELECT * FROM items WHERE id = ?', [itemId], (err, item) => {
+        if (err || !item || !item.is_consumable) {
+            req.session.error = "Consumable item not found.";
+            return res.redirect('/inventory');
+        }
+        if (isNaN(quantityUsed) || quantityUsed <= 0 || quantityUsed > item.quantity) {
+            req.session.error = "Invalid quantity specified.";
+            return res.redirect(`/inventory/view/${itemId}`);
+        }
+
+        const newQuantity = item.quantity - quantityUsed;
+        db.run('UPDATE items SET quantity = ? WHERE id = ?', [newQuantity, itemId], function (err) {
+            if (err) {
+                req.session.error = "Failed to update item quantity.";
+            } else {
+                logAction(req.session.user, 'Used Consumable', item, `Used quantity: ${quantityUsed}, remaining: ${newQuantity}`, req.ip);
+                req.session.success = `Successfully used ${quantityUsed} of "${item.name}".`;
+
+                // Low stock check
+                if (item.low_stock_threshold && newQuantity < item.low_stock_threshold) {
+                    // Check for an existing pending request for this item
+                    db.get("SELECT id FROM purchase_requests WHERE item_name = ? AND status = 'Pending'", [item.name], (err, existingRequest) => {
+                        if (!existingRequest) {
+                            const reason = `Automatic request: Stock dropped to ${newQuantity}, which is below the threshold of ${item.low_stock_threshold}.`;
+                            db.run("INSERT INTO purchase_requests (item_name, reason, requested_by_id) VALUES (?, ?, NULL)", [item.name, reason]);
+                            logAction(null, 'Auto-generated Purchase Request', item, `Stock at ${newQuantity}`);
+                        }
+                    });
+                }
+            }
+            res.redirect(`/inventory/view/${itemId}`);
+        });
+    });
+});
+
+
+// --- Maintenance ---
+app.post('/maintenance/report/:id', requireLogin, (req, res) => {
+    const itemId = req.params.id;
+    const { description } = req.body;
+    db.run('INSERT INTO maintenance_log (item_id, user_id, description) VALUES (?, ?, ?)', [itemId, req.session.user.id, description], function (err) {
+        if (err) {
+            req.session.error = "Failed to report issue.";
+            res.redirect(`/inventory/view/${itemId}`);
+        } else {
+            db.run("UPDATE items SET status = 'Under Maintenance' WHERE id = ?", [itemId], () => {
+                db.get('SELECT name FROM items WHERE id = ?', [itemId], (err, item) => {
+                    logAction(req.session.user, 'Reported Maintenance', item, description, req.ip);
+                    req.session.success = "Maintenance issue reported. Item status has been updated.";
+                    res.redirect(`/inventory/view/${itemId}`);
+                });
+            });
+        }
+    });
+});
+
+app.post('/maintenance/resolve/:log_id', requireRole(['admin', 'manager']), (req, res) => {
+    const { log_id } = req.params;
+    const { resolution_notes } = req.body;
+
+    db.get("SELECT item_id FROM maintenance_log WHERE id = ?", [log_id], (err, log) => {
+        if (err || !log) {
+            req.session.error = "Maintenance log not found.";
+            return res.redirect('/inventory');
+        }
+
+        const sql = "UPDATE maintenance_log SET resolved_date = CURRENT_TIMESTAMP, resolution_notes = ? WHERE id = ?";
+        db.run(sql, [resolution_notes, log_id], (err) => {
+            if (err) {
+                req.session.error = "Failed to resolve maintenance issue.";
+                return res.redirect(`/inventory/view/${log.item_id}`);
+            }
+
+            db.get("SELECT id FROM maintenance_log WHERE item_id = ? AND resolved_date IS NULL", [log.item_id], (err, other_log) => {
+                let newStatus = 'Available'; // Default to available
+                db.get('SELECT quantity_checked_out, quantity FROM items WHERE id = ?', [log.item_id], (err, item) => {
+                    if (item && item.quantity_checked_out > 0) {
+                        newStatus = 'Checked Out';
+                    }
+                    if (!other_log) {
+                        db.run("UPDATE items SET status = ? WHERE id = ?", [newStatus, log.item_id]);
+                    }
+                    db.get('SELECT name FROM items WHERE id = ?', [log.item_id], (err, item) => {
+                        logAction(req.session.user, 'Resolved Maintenance', item, resolution_notes, req.ip);
+                        req.session.success = "Maintenance issue has been resolved.";
+                        res.redirect(`/inventory/view/${log.item_id}`);
+                    });
+                });
+            });
+        });
+    });
+});
+
+// --- Purchase Requests ---
+app.get('/requests/new', requireLogin, (req, res) => {
+    const content = `
+        <div class="card max-w-2xl mx-auto">
+            <form action="/requests/new" method="POST">
+                <div class="mb-4">
+                    <label for="item_name" class="block font-bold text-gray-700">Item Name*</label>
+                    <input type="text" name="item_name" id="item_name" class="w-full p-2 border rounded" required>
+                </div>
+                <div class="mb-4">
+                    <label for="link" class="block font-bold text-gray-700">Link to Purchase (optional)</label>
+                    <input type="url" name="link" id="link" class="w-full p-2 border rounded" placeholder="https://example.com/item">
+                </div>
+                <div class="mb-4">
+                    <label for="reason" class="block font-bold text-gray-700">Reason for Request*</label>
+                    <textarea name="reason" id="reason" class="w-full p-2 border rounded" rows="4" required></textarea>
+                </div>
+                <button type="submit" class="btn btn-primary">Submit Request</button>
+            </form>
+        </div>
+    `;
+    res.send(renderPage(req, 'Request New Item', req.session.user, content));
+});
+
+app.post('/requests/new', requireLogin, (req, res) => {
+    const { item_name, link, reason } = req.body;
+    const requested_by_id = req.session.user.id;
+
+    const sql = 'INSERT INTO purchase_requests (requested_by_id, item_name, link, reason) VALUES (?, ?, ?, ?)';
+    db.run(sql, [requested_by_id, item_name, link, reason], function (err) {
+        if (err) {
+            req.session.error = "Failed to submit purchase request.";
+            res.redirect('/requests/new');
+        } else {
+            logAction(req.session.user, 'Submitted Purchase Request', null, `Item: ${item_name}`, req.ip);
+            req.session.success = "Purchase request submitted successfully.";
+            res.redirect('/dashboard');
+        }
+    });
+});
+
+
+// --- Reservations ---
+app.get('/reservations', requireLogin, (req, res) => {
+    const today = new Date();
+    const monthQuery = req.query.month;
+    const yearQuery = req.query.year;
+
+    const month = (monthQuery !== undefined && !isNaN(parseInt(monthQuery, 10))) ? parseInt(monthQuery, 10) : today.getMonth();
+    const year = (yearQuery !== undefined && !isNaN(parseInt(yearQuery, 10))) ? parseInt(yearQuery, 10) : today.getFullYear();
+
+
+    const firstDay = new Date(year, month, 1);
+    const lastDay = new Date(year, month + 1, 0);
+    const monthName = firstDay.toLocaleString('default', { month: 'long' });
+
+    const prevMonth = month === 0 ? 11 : month - 1;
+    const prevYear = month === 0 ? year - 1 : year;
+    const nextMonth = month === 11 ? 0 : month + 1;
+    const nextYear = month === 11 ? year + 1 : year;
+
+    const sql = `
+        SELECT r.id, r.start_date, r.end_date, i.name as item_name, u.name as user_name, r.user_id
+        FROM reservations r
+        JOIN items i ON r.item_id = i.id
+        JOIN users u ON r.user_id = u.id
+        WHERE r.status = 'Active' AND
+              ((start_date BETWEEN ? AND ?) OR (end_date BETWEEN ? AND ?))
+    `;
+    const startDateStr = `${year}-${String(month + 1).padStart(2, '0')}-01`;
+    const endDateStr = `${year}-${String(month + 1).padStart(2, '0')}-${lastDay.getDate()}`;
+
+    db.all(sql, [startDateStr, endDateStr, startDateStr, endDateStr], (err, reservations) => {
+        db.all('SELECT id, name FROM items WHERE status != "Archived" AND is_consumable = 0 ORDER BY name', (err, items) => {
+
+            let calendarHtml = '';
+            const daysInMonth = lastDay.getDate();
+            const startingDay = firstDay.getDay();
+
+            for (let i = 0; i < startingDay; i++) {
+                calendarHtml += `<div class="border p-2 bg-gray-50"></div>`;
+            }
+
+            for (let day = 1; day <= daysInMonth; day++) {
+                const currentDate = new Date(year, month, day);
+                const reservationsForDay = reservations.filter(r => {
+                    const start = new Date(r.start_date + 'T00:00:00');
+                    const end = new Date(r.end_date + 'T00:00:00');
+                    return currentDate >= start && currentDate <= end;
+                });
+
+                let eventsHtml = reservationsForDay.map(r => {
+                    let cancelForm = '';
+                    if (req.session.user.role !== 'user' || r.user_id === req.session.user.id) {
+                        cancelForm = `<form class="inline" action="/reservations/cancel/${r.id}" method="POST"><button class="text-red-500 text-xs hover:underline ml-1">(Cancel)</button></form>`;
+                    }
+                    return `
+                        <li class="bg-sky-100 p-1 rounded">
+                            <p class="font-semibold">${r.item_name}</p>
+                            <p>${r.user_name} ${cancelForm}</p>
+                        </li>`;
+                }).join('');
+
+                calendarHtml += `<div class="border p-2 min-h-[120px]">
+                    <div class="font-bold">${day}</div>
+                    <ul class="text-xs space-y-1 mt-1">
+                        ${eventsHtml}
+                    </ul>itManagementHtml}
                                          <div class="md:col-span-2 pt-6 mt-6 border-t">
                                             <h3 class="text-xl font-bold mb-4">Manage Related Items</h3>
                                             <div class="card bg-gray-50">
@@ -2600,7 +3081,7 @@ app.post('/users/delete/:id', requireRole(['admin']), (req, res) => {
     const adminUserId = req.session.user.id;
 
     if (userIdToDelete == adminUserId) {
-        req.session.error = "You cannot delete your own account.";
+        req.session.error = "You cannot delete your own account. sorry.";
         return res.redirect('/users');
     }
 
