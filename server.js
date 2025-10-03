@@ -3,7 +3,6 @@
  * Miami Beach Senior High Robotics Team - Inventory Tracker
  * =================================================================
  * Version: 4.0.2 (Critical Bugfix Release)
- * Author: Thalia (with major feature additions and fixes by Gemini)
  * Description: A complete, single-file Node.js application to manage
  * team inventory with a global search, project-based checkouts,
  * advanced user profiles, consumable item tracking, and much more.
