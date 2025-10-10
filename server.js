@@ -2,11 +2,14 @@
  * =================================================================
  * Miami Beach Senior High Robotics Team - Inventory Tracker
  * =================================================================
-<<<<<<< HEAD
- * Version: 3.0.5 (Kits, Sorting & Advanced Quantity)
+ * Version: 3.0.7 (Kit Logic Fix)
  * Author: Thalia (with fixes by Gemini)
  * Description: A complete, single-file Node.js application to manage
  * team inventory with advanced admin controls and a refreshed UI.
+ *
+ * Change Log (v3.0.7):
+ * - FIXED: A critical logic bug where checking in a multi-quantity item would incorrectly keep its status as "Checked Out".
+ * - REMOVED: Dark mode was reverted to the default light theme.
  *
  * Change Log (v3.0.5):
  * - ADDED: Item "Kit" functionality. Items can be designated as kits and require other items as components.
@@ -14,30 +17,7 @@
  * - ADDED: UI for managing kit components on the item edit page.
  * - ADDED: Sorting functionality to the main inventory table (sort by ID, name, category, status).
  * - IMPROVED: Quantity tracking. Items with multiple quantities now show how many are checked out (e.g., "1/3 Checked Out").
- * - IMPROVED: Check-in/out logic now handles fractional quantities.
  * - SECURITY: Session secret is now loaded from an environment variable (`process.env.SESSION_SECRET`).
- *
- * Change Log (v3.0.4):
- * - ADDED: Fully responsive, mobile-first design.
- * - ADDED: Hamburger menu for navigation on mobile devices.
- * - IMPROVED: Tables now reflow into a card-based layout on smaller screens for readability.
-=======
- * Version: 2.7.0 (User Deletion Update)
- * Author: Thalia
- * Description: A complete, single-file Node.js application to manage
- * team inventory with advanced admin controls.
->>>>>>> parent of 725f65f (Update server.js)
- *
- * Features Included:
- * - User Authentication (Admin, Manager, User roles) with Self-Registration
- * - Full CRUD for Inventory Items with Image Uploads & Kit Management
- * - Automatic serial number generation for new items
- * - QR Code Generation & Scanning for quick actions
- * - Advanced Reservations (2-week limit, extension requests)
- * - Location/Cabinet Management & Purchase Request System
- * - Advanced Reporting Dashboard with Charts
- * - Bulk CSV Data Import & Export & Comprehensive Audit Log
- * - Admin user moderation (Timeout/Ban/Delete)
  * =================================================================
  */
 
@@ -657,7 +637,7 @@ app.get('/qr/:itemId', requireLogin, (req, res) => {
         if (err) {
             res.status(500).send("Error generating QR code.");
         } else {
-            res.send(`<img src="${dataUrl}" alt="QR Code">`);
+            res.send(`<body style="background:white; display:flex; justify-content:center; align-items:center; height:100vh; margin:0;"><img src="${dataUrl}" alt="QR Code"></body>`);
         }
     });
 });
@@ -824,7 +804,13 @@ app.get('/inventory', requireLogin, (req,res) => {
 
 app.get('/inventory/add', requireRole(['admin', 'manager']), (req, res) => {
     db.all('SELECT * FROM locations', (err, locations) => {
+    db.all('SELECT DISTINCT manufacturer FROM items WHERE manufacturer IS NOT NULL AND manufacturer != "" ORDER BY manufacturer', (err, manufacturers) => {
+    db.all('SELECT DISTINCT condition FROM items WHERE condition IS NOT NULL AND condition != "" ORDER BY condition', (err, conditions) => {
+
         const locationsOptions = locations.map(l => `<option value="${l.id}">${l.name}</option>`).join('');
+        const manufacturersDatalist = manufacturers.map(m => `<option value="${m.manufacturer}"></option>`).join('');
+        const conditionsDatalist = conditions.map(c => `<option value="${c.condition}"></option>`).join('');
+
         const content = `
             <div class="card max-w-4xl mx-auto">
                 <form action="/inventory/add" method="POST" enctype="multipart/form-data">
@@ -833,8 +819,18 @@ app.get('/inventory/add', requireRole(['admin', 'manager']), (req, res) => {
                         <div><label class="block">Category</label><input type="text" name="category" class="w-full p-2 border rounded"></div>
                         <div><label class="block">Model Number</label><input type="text" name="model_number" class="w-full p-2 border rounded"></div>
                         <div><label class="block">Serial Number (optional)</label><input type="text" name="serial_number" class="w-full p-2 border rounded"></div>
-                        <div><label class="block">Manufacturer/Supplier</label><input type="text" name="manufacturer" class="w-full p-2 border rounded"></div>
-                        <div><label class="block">Condition</label><input type="text" name="condition" class="w-full p-2 border rounded"></div>
+                        
+                        <div>
+                            <label class="block">Manufacturer/Supplier</label>
+                            <input type="text" name="manufacturer" list="manufacturer-list" class="w-full p-2 border rounded">
+                            <datalist id="manufacturer-list">${manufacturersDatalist}</datalist>
+                        </div>
+                        <div>
+                            <label class="block">Condition</label>
+                            <input type="text" name="condition" list="condition-list" class="w-full p-2 border rounded">
+                            <datalist id="condition-list">${conditionsDatalist}</datalist>
+                        </div>
+
                         <div><label class="block">Location</label><select name="location_id" class="w-full p-2 border rounded">${locationsOptions}</select></div>
                         <div><label class="block">Quantity</label><input type="number" name="quantity" value="1" min="1" class="w-full p-2 border rounded"></div>
                         <div class="md:col-span-2"><label class="block">Specifications</label><textarea name="specifications" class="w-full p-2 border rounded"></textarea></div>
@@ -850,6 +846,8 @@ app.get('/inventory/add', requireRole(['admin', 'manager']), (req, res) => {
             </div>
         `;
         res.send(renderPage(req, 'Add New Item', req.session.user, content));
+    });
+    });
     });
 });
 
@@ -1018,7 +1016,7 @@ app.get('/inventory/view/:id', requireLogin, async (req, res) => {
                     <div>
                         <div class="card text-center">
                             <h3 class="font-bold mb-2">Item QR Code</h3>
-                             <img src="${qrCodeUrl}" alt="QR Code" class="mx-auto max-w-full h-auto">
+                             <img src="${qrCodeUrl}" alt="QR Code" class="mx-auto max-w-full h-auto bg-white p-2 rounded-lg">
                             <a href="/qr/${item.id}" target="_blank" class="text-sm text-sky-600 hover:underline mt-2 inline-block">Open in new tab</a>
                         </div>
                          <div class="card mt-6">
@@ -1045,9 +1043,13 @@ app.get('/inventory/edit/:id', requireRole(['admin', 'manager']), (req, res) => 
         db.all('SELECT * FROM locations', (err, locations) => {
         db.all('SELECT id, name FROM items WHERE id != ? AND is_kit = 0 ORDER BY name', [itemId], (err, all_items) => {
         db.all('SELECT i.id, i.name FROM items i JOIN kits k ON i.id = k.item_id WHERE k.kit_id = ?', [itemId], (err, kit_components) => {
-
-            const locationsOptions = locations.map(l => `<option value="${l.id}" ${item.location_id === l.id ? 'selected' : ''}>${l.name}</option>`).join('');
+        db.all('SELECT DISTINCT manufacturer FROM items WHERE manufacturer IS NOT NULL AND manufacturer != "" ORDER BY manufacturer', (err, manufacturers) => {
+        db.all('SELECT DISTINCT condition FROM items WHERE condition IS NOT NULL AND condition != "" ORDER BY condition', (err, conditions) => {
             
+            const locationsOptions = locations.map(l => `<option value="${l.id}" ${item.location_id === l.id ? 'selected' : ''}>${l.name}</option>`).join('');
+            const manufacturersDatalist = manufacturers.map(m => `<option value="${m.manufacturer}"></option>`).join('');
+            const conditionsDatalist = conditions.map(c => `<option value="${c.condition}"></option>`).join('');
+
             const componentIds = kit_components.map(c => c.id);
             const availableItemsForKit = all_items.filter(i => !componentIds.includes(i.id));
             const allItemsOptions = availableItemsForKit.map(i => `<option value="${i.id}">${i.name}</option>`).join('');
@@ -1091,8 +1093,18 @@ app.get('/inventory/edit/:id', requireRole(['admin', 'manager']), (req, res) => 
                             <div><label class="block">Category</label><input type="text" name="category" value="${item.category || ''}" class="w-full p-2 border rounded"></div>
                             <div><label class="block">Model Number</label><input type="text" name="model_number" value="${item.model_number || ''}" class="w-full p-2 border rounded"></div>
                             <div><label class="block">Serial Number</label><input type="text" name="serial_number" value="${item.serial_number || ''}" class="w-full p-2 border rounded"></div>
-                            <div><label class="block">Manufacturer/Supplier</label><input type="text" name="manufacturer" value="${item.manufacturer || ''}" class="w-full p-2 border rounded"></div>
-                            <div><label class="block">Condition</label><input type="text" name="condition" value="${item.condition || ''}" class="w-full p-2 border rounded"></div>
+                            
+                            <div>
+                                <label class="block">Manufacturer/Supplier</label>
+                                <input type="text" name="manufacturer" value="${item.manufacturer || ''}" list="manufacturer-list" class="w-full p-2 border rounded">
+                                <datalist id="manufacturer-list">${manufacturersDatalist}</datalist>
+                            </div>
+                            <div>
+                                <label class="block">Condition</label>
+                                <input type="text" name="condition" value="${item.condition || ''}" list="condition-list" class="w-full p-2 border rounded">
+                                <datalist id="condition-list">${conditionsDatalist}</datalist>
+                            </div>
+
                             <div><label class="block">Location</label><select name="location_id" class="w-full p-2 border rounded">${locationsOptions}</select></div>
                             <div><label class="block">Total Quantity</label><input type="number" name="quantity" value="${item.quantity}" min="1" class="w-full p-2 border rounded"></div>
                             <div class="md:col-span-2"><label class="block">Specifications</label><textarea name="specifications" class="w-full p-2 border rounded">${item.specifications || ''}</textarea></div>
@@ -1113,6 +1125,8 @@ app.get('/inventory/edit/:id', requireRole(['admin', 'manager']), (req, res) => 
                 </div>
             `;
             res.send(renderPage(req, `Edit: ${item.name}`, req.session.user, content));
+        });
+        });
         });
         });
         });
@@ -1226,6 +1240,7 @@ app.post('/inventory/checkout/:id', requireLogin, (req, res) => {
                 db.run('BEGIN TRANSACTION');
                 let hadError = false;
                 itemsToCheckOut.forEach(thing => {
+                    if (hadError) return;
                     const newQuantityCheckedOut = thing.quantity_checked_out + 1;
                     const newStatus = newQuantityCheckedOut >= thing.quantity ? 'Checked Out' : 'Available';
                     db.run('UPDATE items SET quantity_checked_out = ?, status = ?, last_activity_date = CURRENT_TIMESTAMP, checked_out_by_id = ? WHERE id = ?', 
@@ -1233,16 +1248,23 @@ app.post('/inventory/checkout/:id', requireLogin, (req, res) => {
                         if (err) hadError = true;
                     });
                 });
-                db.run('COMMIT', (err) => {
-                    if (err || hadError) {
-                        db.run('ROLLBACK');
-                        req.session.error = `A database error occurred during checkout.`;
-                    } else {
-                        logAction(req.session.user, item.is_kit ? 'Checked Out Kit' : 'Checked Out Item', item, '', req.ip);
-                        req.session.success = `"${item.name}" checked out successfully.`;
-                    }
+                
+                if (hadError) {
+                    db.run('ROLLBACK');
+                    req.session.error = `A database error occurred during checkout.`;
                     res.redirect(req.get('referer') || '/inventory');
-                });
+                } else {
+                    db.run('COMMIT', (err) => {
+                        if (err) {
+                            db.run('ROLLBACK');
+                            req.session.error = `A database error occurred during checkout.`;
+                        } else {
+                            logAction(req.session.user, item.is_kit ? 'Checked Out Kit' : 'Checked Out Item', item, '', req.ip);
+                            req.session.success = `"${item.name}" checked out successfully.`;
+                        }
+                        res.redirect(req.get('referer') || '/inventory');
+                    });
+                }
             });
         };
 
@@ -1268,12 +1290,15 @@ app.post('/inventory/checkout/:id', requireLogin, (req, res) => {
 
 app.post('/inventory/checkin/:id', requireLogin, (req, res) => {
     const itemId = req.params.id;
-    const userId = req.session.user.id;
 
     db.get('SELECT * FROM items WHERE id = ?', [itemId], (err, item) => {
         if (err || !item) {
             req.session.error = "Item not found.";
             return res.redirect(req.get('referer') || '/inventory');
+        }
+        if (item.quantity_checked_out <= 0) {
+            req.session.error = `Cannot check in "${item.name}". It is already fully checked in.`;
+            return res.redirect(req.get('referer') || `/inventory/view/${itemId}`);
         }
 
         const itemsToCheckIn = [item];
@@ -1282,39 +1307,47 @@ app.post('/inventory/checkin/:id', requireLogin, (req, res) => {
              db.serialize(() => {
                 db.run('BEGIN TRANSACTION');
                 let hadError = false;
-                itemsToCheckIn.forEach(thing => {
-                    const newQuantityCheckedOut = Math.max(0, thing.quantity_checked_out - 1);
-                    const newStatus = newQuantityCheckedOut > 0 ? 'Checked Out' : 'Available'; 
-                    
-                    let updateSql = 'UPDATE items SET quantity_checked_out = ?, status = ?, last_activity_date = CURRENT_TIMESTAMP WHERE id = ?';
-                    let params = [newQuantityCheckedOut, newStatus, thing.id];
 
-                    if (newQuantityCheckedOut === 0) {
-                        updateSql = 'UPDATE items SET quantity_checked_out = ?, status = ?, last_activity_date = CURRENT_TIMESTAMP, checked_out_by_id = NULL WHERE id = ?';
-                        params = [newQuantityCheckedOut, 'Available', thing.id];
-                    }
+                itemsToCheckIn.forEach(thing => {
+                    if(hadError) return;
+                    
+                    const newQuantityCheckedOut = Math.max(0, thing.quantity_checked_out - 1);
+                    // When an item is checked in, it should become 'Available' unless it's still fully checked out
+                    // which is impossible during a check-in. This correctly handles multi-quantity items.
+                    const newStatus = 'Available'; 
+                    
+                    // If the new checked-out quantity is 0, clear the user association. Otherwise, leave it.
+                    let updateSql = `UPDATE items 
+                                     SET quantity_checked_out = ?, 
+                                         status = ?, 
+                                         last_activity_date = CURRENT_TIMESTAMP, 
+                                         checked_out_by_id = CASE WHEN ? = 0 THEN NULL ELSE checked_out_by_id END 
+                                     WHERE id = ?`;
+                    let params = [newQuantityCheckedOut, newStatus, newQuantityCheckedOut, thing.id];
 
                     db.run(updateSql, params, function(err) {
                         if (err) hadError = true;
                     });
                 });
-                db.run('COMMIT', (err) => {
-                    if (err || hadError) {
-                        db.run('ROLLBACK');
-                        req.session.error = `A database error occurred during check-in.`;
-                    } else {
-                        logAction(req.session.user, item.is_kit ? 'Checked In Kit' : 'Checked In Item', item, '', req.ip);
-                        req.session.success = `"${item.name}" checked in successfully.`;
-                    }
-                    res.redirect(req.get('referer') || '/inventory');
-                });
+                
+                if (hadError) {
+                     db.run('ROLLBACK');
+                     req.session.error = `A database error occurred during check-in.`;
+                     res.redirect(req.get('referer') || '/inventory');
+                } else {
+                    db.run('COMMIT', (err) => {
+                        if (err) {
+                           db.run('ROLLBACK');
+                           req.session.error = `A database error occurred during check-in.`;
+                        } else {
+                            logAction(req.session.user, item.is_kit ? 'Checked In Kit' : 'Checked In Item', item, '', req.ip);
+                            req.session.success = `"${item.name}" checked in successfully.`;
+                        }
+                        res.redirect(req.get('referer') || '/inventory');
+                    });
+                }
             });
         };
-        
-        if (item.quantity_checked_out <= 0) {
-            req.session.error = `Cannot check in "${item.name}". It is already fully checked in.`;
-            return res.redirect(req.get('referer') || `/inventory/view/${itemId}`);
-        }
         
         if (item.is_kit) {
             db.all('SELECT * FROM items i JOIN kits k ON i.id = k.item_id WHERE k.kit_id = ?', [itemId], (err, components) => {
@@ -1326,6 +1359,7 @@ app.post('/inventory/checkin/:id', requireLogin, (req, res) => {
         }
     });
 });
+
 
 // --- Maintenance ---
 app.post('/maintenance/report/:id', requireLogin, (req, res) => {
@@ -1365,19 +1399,16 @@ app.post('/maintenance/resolve/:log_id', requireRole(['admin', 'manager']), (req
             }
 
             db.get("SELECT id FROM maintenance_log WHERE item_id = ? AND resolved_date IS NULL", [log.item_id], (err, other_log) => {
-                let newStatus = 'Available'; // Default to available
-                db.get('SELECT quantity_checked_out, quantity FROM items WHERE id = ?', [log.item_id], (err, item) => {
-                    if (item && item.quantity_checked_out > 0) {
-                        newStatus = 'Checked Out';
-                    }
-                    if (!other_log) { 
+                if (!other_log) { // Only change status if no other open maintenance logs exist for this item
+                     db.get('SELECT quantity_checked_out, quantity FROM items WHERE id = ?', [log.item_id], (err, item) => {
+                        const newStatus = (item && item.quantity_checked_out >= item.quantity) ? 'Checked Out' : 'Available';
                         db.run("UPDATE items SET status = ? WHERE id = ?", [newStatus, log.item_id]);
-                    }
-                    db.get('SELECT name FROM items WHERE id = ?', [log.item_id], (err, item) => {
-                        logAction(req.session.user, 'Resolved Maintenance', item, resolution_notes, req.ip);
-                        req.session.success = "Maintenance issue has been resolved.";
-                        res.redirect(`/inventory/view/${log.item_id}`);
                     });
+                }
+                db.get('SELECT name FROM items WHERE id = ?', [log.item_id], (err, item) => {
+                    logAction(req.session.user, 'Resolved Maintenance', item, resolution_notes, req.ip);
+                    req.session.success = "Maintenance issue has been resolved.";
+                    res.redirect(`/inventory/view/${log.item_id}`);
                 });
             });
         });
@@ -2448,19 +2479,28 @@ app.post('/data/import', requireRole(['admin']), upload.single('csvFile'), (req,
                 db.run('BEGIN TRANSACTION');
                 const stmt = db.prepare(sql);
                 items.forEach(item => {
-                    stmt.run([item.name, item.category, item.model_number, item.serial_number, item.manufacturer, item.condition, item.quantity]);
+                    const sn = item.serial_number && item.serial_number.trim() !== '' ? item.serial_number.trim() : `MBSH-${Date.now()}-${Math.random()}`;
+                    stmt.run([item.name, item.category, item.model_number, sn, item.manufacturer, item.condition, item.quantity]);
                 });
-                stmt.finalize();
-                db.run('COMMIT', (err) => {
+                stmt.finalize((err) => {
                     if (err) {
                         db.run('ROLLBACK');
-                        req.session.error = `Transaction failed: ${err.message}. No items were imported.`;
+                        req.session.error = `Import failed: ${err.message}. A serial number might be duplicated. No items were imported.`;
+                        fs.unlinkSync(req.file.path);
+                        res.redirect('/data');
                     } else {
-                        logAction(req.session.user, 'Imported Data', null, `Imported ${rowCount} items from CSV.`, req.ip);
-                        req.session.success = `Successfully processed ${rowCount} items from CSV.`;
+                        db.run('COMMIT', (err) => {
+                            if (err) {
+                                db.run('ROLLBACK');
+                                req.session.error = `Transaction failed: ${err.message}. No items were imported.`;
+                            } else {
+                                logAction(req.session.user, 'Imported Data', null, `Imported ${rowCount} items from CSV.`, req.ip);
+                                req.session.success = `Successfully processed ${rowCount} items from CSV.`;
+                            }
+                            fs.unlinkSync(req.file.path);
+                            res.redirect('/inventory');
+                        });
                     }
-                    fs.unlinkSync(req.file.path);
-                    res.redirect('/inventory');
                 });
             });
         });
