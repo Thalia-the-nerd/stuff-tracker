@@ -2,10 +2,14 @@
  * =================================================================
  * Miami Beach Senior High Robotics Team - Inventory Tracker
  * =================================================================
- * Version: 3.0.7 (Kit Logic Fix)
+ * Version: 3.0.8 (User Permissions Update)
  * Author: Thalia (with fixes by Gemini)
  * Description: A complete, single-file Node.js application to manage
  * team inventory with advanced admin controls and a refreshed UI.
+ *
+ * Change Log (v3.0.8):
+ * - MODIFIED: All authenticated users can now create and edit items.
+ * - MODIFIED: The delete item functionality remains restricted to admins and managers.
  *
  * Change Log (v3.0.7):
  * - FIXED: A critical logic bug where checking in a multi-quantity item would incorrectly keep its status as "Checked Out".
@@ -802,7 +806,7 @@ app.get('/inventory', requireLogin, (req,res) => {
     });
 });
 
-app.get('/inventory/add', requireRole(['admin', 'manager']), (req, res) => {
+app.get('/inventory/add', requireRole(['admin', 'manager', 'user']), (req, res) => {
     db.all('SELECT * FROM locations', (err, locations) => {
     db.all('SELECT DISTINCT manufacturer FROM items WHERE manufacturer IS NOT NULL AND manufacturer != "" ORDER BY manufacturer', (err, manufacturers) => {
     db.all('SELECT DISTINCT condition FROM items WHERE condition IS NOT NULL AND condition != "" ORDER BY condition', (err, conditions) => {
@@ -851,7 +855,7 @@ app.get('/inventory/add', requireRole(['admin', 'manager']), (req, res) => {
     });
 });
 
-app.post('/inventory/add', requireRole(['admin', 'manager']), upload.single('itemImage'), (req, res) => {
+app.post('/inventory/add', requireRole(['admin', 'manager', 'user']), upload.single('itemImage'), (req, res) => {
     const { name, quantity, model_number, serial_number, manufacturer, category, condition, specifications, location_id, comment } = req.body;
     const is_kit = req.body.is_kit ? 1 : 0;
     
@@ -895,13 +899,14 @@ app.get('/inventory/view/:id', requireLogin, async (req, res) => {
             
             const openMaintenanceLog = maintenance_logs.find(log => !log.resolved_date);
 
-            let adminActions = '';
-            if(req.session.user.role !== 'user') {
-                adminActions = `<div class="flex gap-2"><a href="/inventory/edit/${item.id}" class="btn btn-secondary">Edit</a>
+            let adminActions = `<div class="flex gap-2"><a href="/inventory/edit/${item.id}" class="btn btn-secondary">Edit</a>`;
+            if(req.session.user.role !== 'user') { // Admins and Managers
+                adminActions += `
                 <form action="/inventory/delete/${item.id}" method="POST" onsubmit="return confirm('Are you sure you want to permanently delete this item?');">
                     <button type="submit" class="btn btn-danger">Delete</button>
-                </form></div>`;
+                </form>`;
             }
+            adminActions += `</div>`;
             
             let actionBox = '';
             if (item.status !== 'Under Maintenance') {
@@ -1033,7 +1038,7 @@ app.get('/inventory/view/:id', requireLogin, async (req, res) => {
     });
 });
 
-app.get('/inventory/edit/:id', requireRole(['admin', 'manager']), (req, res) => {
+app.get('/inventory/edit/:id', requireRole(['admin', 'manager', 'user']), (req, res) => {
     const itemId = req.params.id;
     db.get('SELECT * FROM items WHERE id = ?', [itemId], (err, item) => {
         if(err || !item) {
@@ -1133,7 +1138,7 @@ app.get('/inventory/edit/:id', requireRole(['admin', 'manager']), (req, res) => 
     });
 });
 
-app.post('/inventory/edit/:id', requireRole(['admin', 'manager']), upload.single('itemImage'), (req, res) => {
+app.post('/inventory/edit/:id', requireRole(['admin', 'manager', 'user']), upload.single('itemImage'), (req, res) => {
     const itemId = req.params.id;
     const { name, quantity, model_number, serial_number, manufacturer, category, condition, specifications, location_id, comment } = req.body;
     const is_kit = req.body.is_kit ? 1 : 0;
@@ -2544,5 +2549,4 @@ app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server running on http://0.0.0.0:${PORT}`);
     console.log(`For Miami Beach Senior High Robotics Team`);
 });
-
 
