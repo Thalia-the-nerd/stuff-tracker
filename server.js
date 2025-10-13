@@ -2,10 +2,15 @@
  * =================================================================
  * Miami Beach Senior High Robotics Team - Inventory Tracker
  * =================================================================
- * Version: 3.0.8 (User Permissions Update)
+ * Version: 3.0.9 (Automatic Backups Update)
  * Author: Thalia (with fixes by Gemini)
  * Description: A complete, single-file Node.js application to manage
  * team inventory with advanced admin controls and a refreshed UI.
+ *
+ * Change Log (v3.0.9):
+ * - ADDED: Automatic database backups. Hourly backups are kept for 7 days,
+ * and permanent backups are created every 36 hours.
+ * - NOTE: This feature requires the 'node-cron' package (`npm install node-cron`).
  *
  * Change Log (v3.0.8):
  * - MODIFIED: All authenticated users can now create and edit items.
@@ -36,6 +41,7 @@ const fs = require('fs');
 const csv = require('fast-csv');
 const QRCode = require('qrcode');
 const crypto = require('crypto'); // For session secret
+const cron = require('node-cron'); // For scheduled backups
 
 const app = express();
 const PORT = process.env.PORT || 4899;
@@ -1221,7 +1227,7 @@ app.post('/inventory/kit/remove/:kitId/:itemId', requireRole(['admin', 'manager'
             req.session.error = "Failed to remove component.";
         } else {
             logAction(req.session.user, 'Removed Kit Component', {id: kitId}, `Removed item ID ${itemId}`, req.ip);
-            req.session.success = "Component removed from kit.";
+            req.session.success = "Component removed from from kit.";
         }
         res.redirect(`/inventory/edit/${kitId}`);
     });
@@ -2530,6 +2536,113 @@ app.get('/data/export/:type', requireRole(['admin']), (req, res) => {
         logAction(req.session.user, 'Exported Data', null, `Exported ${type} to CSV.`, req.ip);
     });
 });
+
+// 7.5. AUTOMATIC DATABASE BACKUPS
+const DB_PATH = './mbs_robotics_inventory.db';
+const BACKUP_PATH = 'backups';
+const HOURLY_BACKUP_PATH = path.join(BACKUP_PATH, 'hourly');
+const PERMANENT_BACKUP_PATH = path.join(BACKUP_PATH, 'permanent');
+const LAST_PERMANENT_BACKUP_FILE = path.join(BACKUP_PATH, 'last_permanent_backup.txt');
+
+// Create backup directories on startup if they don't exist
+fs.mkdirSync(HOURLY_BACKUP_PATH, { recursive: true });
+fs.mkdirSync(PERMANENT_BACKUP_PATH, { recursive: true });
+
+/**
+ * Creates a backup of the main database file.
+ * @param {string} destinationDir - The directory to save the backup in.
+ * @param {string} prefix - The prefix for the backup filename (e.g., 'hourly').
+ */
+function createBackup(destinationDir, prefix) {
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const backupFileName = `${prefix}-backup-${timestamp}.db`;
+    const backupFilePath = path.join(destinationDir, backupFileName);
+
+    fs.copyFile(DB_PATH, backupFilePath, (err) => {
+        if (err) {
+            console.error(`[Backup Error] Could not create ${prefix} backup:`, err);
+        } else {
+            console.log(`[Backup] Successfully created ${prefix} backup: ${backupFileName}`);
+            logAction(null, 'System Backup', null, `Created ${prefix} backup: ${backupFileName}`, 'localhost');
+        }
+    });
+}
+
+/**
+ * Deletes hourly backups that are older than 7 days.
+ */
+function cleanupOldBackups() {
+    console.log('[Backup] Running cleanup for old hourly backups...');
+    const weekAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
+    fs.readdir(HOURLY_BACKUP_PATH, (err, files) => {
+        if (err) {
+            console.error('[Backup Error] Could not read hourly backup directory for cleanup:', err);
+            return;
+        }
+        files.forEach(file => {
+            if (file.startsWith('hourly-backup-')) {
+                const filePath = path.join(HOURLY_BACKUP_PATH, file);
+                fs.stat(filePath, (statErr, stats) => {
+                    if (statErr) {
+                        console.error(`[Backup Error] Could not get stats for file ${file}:`, statErr);
+                        return;
+                    }
+                    if (stats.mtime.getTime() < weekAgo) {
+                        fs.unlink(filePath, (unlinkErr) => {
+                            if (unlinkErr) {
+                                console.error(`[Backup Error] Could not delete old backup ${file}:`, unlinkErr);
+                            } else {
+                                console.log(`[Backup] Deleted old hourly backup: ${file}`);
+                            }
+                        });
+                    }
+                });
+            }
+        });
+    });
+}
+
+// Schedule hourly backups
+cron.schedule('0 * * * *', () => {
+    console.log('[Backup] Creating hourly backup...');
+    createBackup(HOURLY_BACKUP_PATH, 'hourly');
+});
+
+// Schedule permanent backups (every 36 hours)
+// This runs a check every hour to see if 36 hours have passed.
+cron.schedule('5 * * * *', () => {
+    const now = Date.now();
+    const thirtySixHoursInMillis = 36 * 60 * 60 * 1000;
+
+    let lastBackupTime = 0;
+    if (fs.existsSync(LAST_PERMANENT_BACKUP_FILE)) {
+        try {
+            const timeStr = fs.readFileSync(LAST_PERMANENT_BACKUP_FILE, 'utf8');
+            lastBackupTime = parseInt(timeStr, 10) || 0;
+        } catch (readErr) {
+            console.error('[Backup Error] Could not read last permanent backup time file.', readErr);
+        }
+    }
+
+    if (now - lastBackupTime >= thirtySixHoursInMillis) {
+        console.log('[Backup] 36-hour interval passed. Creating permanent backup...');
+        createBackup(PERMANENT_BACKUP_PATH, 'permanent');
+        try {
+            fs.writeFileSync(LAST_PERMANENT_BACKUP_FILE, now.toString());
+        } catch (writeErr) {
+             console.error('[Backup Error] Could not write last permanent backup time file.', writeErr);
+        }
+    }
+});
+
+
+// Schedule cleanup of old hourly backups (runs once a day at 1:10 AM)
+cron.schedule('10 1 * * *', () => {
+    cleanupOldBackups();
+});
+
+console.log('Automatic backup jobs scheduled.');
+
 
 // 404 Handler - Must be the last route
 app.use((req, res, next) => {
