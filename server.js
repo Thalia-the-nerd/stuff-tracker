@@ -74,7 +74,7 @@ const db = new sqlite3.Database('./mbs_robotics_inventory.db', (err) => {
     }
 });
 
-function initializeDb() {
+function initializeDb() { //sometimes it needs to be restarted after editing roles
     db.serialize(() => {
         // --- Core Tables ---
         db.run(`CREATE TABLE IF NOT EXISTS users (
@@ -192,7 +192,7 @@ function initializeDb() {
                     console.log(`Updating ${table} schema: Adding ${column} column...`);
                     db.run(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`, (alterErr) => {
                         if (alterErr) console.error(`Failed to update ${table} schema:`, alterErr);
-                        else console.log(`Schema for ${table} updated successfully.`);
+                        else console.log(`Schema for ${table} updated successfully.`); //it has like a 50/50 chance of killing it self so be ware
                     });
                 }
             });
