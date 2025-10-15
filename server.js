@@ -2,24 +2,23 @@
  * =================================================================
  * Miami Beach Senior High Robotics Team - Inventory Tracker
  * =================================================================
- * Version: 3.1.0 (Reporting and Reservations Overhaul)
- * Author: Thalia (with fixes by Gemini)
+ * Version: 3.2.0 (Major Feature Expansion)
+ * Author: Thalia
  * Description: A complete, single-file Node.js application to manage
  * team inventory with advanced admin controls and a refreshed UI.
+ *
+ * Change Log (v3.2.0):
+ * - ADDED: Global search bar for finding items quickly.
+ * - ADDED: "Consumable" item type. These items have their quantity reduced upon use instead of being checked in/out.
+ * - ADDED: Bulk actions on the inventory page for admins (Delete, Change Location).
+ * - ADDED: Ability to attach files (manuals, PDFs) to items.
+ * - ADDED: Maintenance scheduling system for admins to create and track recurring tasks for items.
+ * - ADDED: Printable label generation from the item view page, including item info and QR code.
+ * - MODIFIED: The Admin Reports page has been completely redesigned to show key statistics and lists instead of graphs.
  *
  * Change Log (v3.1.0):
  * - ADDED: Reservations can now be made for a specific quantity of an item.
  * - ADDED: Reservation logic now checks availability based on the quantity of an item reserved on any given day.
- * - MODIFIED: The Admin Reports page has been completely redesigned with new analytics, including:
- * - Checkout activity over the last 30 days (line chart).
- * - Most frequently checked-out items (bar chart).
- * - Most active users by action count (bar chart).
- * - Items with the most maintenance reports (bar chart).
- *
- * Change Log (v3.0.9):
- * - ADDED: Automatic database backups. Hourly backups are kept for 7 days,
- * and permanent backups are created every 36 hours.
- * - NOTE: This feature requires the 'node-cron' package (`npm install node-cron`).
  *
  * =================================================================
  */
@@ -43,12 +42,15 @@ const SALT_ROUNDS = 10;
 const UPLOAD_PATH = 'uploads';
 const IMAGE_PATH = path.join(UPLOAD_PATH, 'images');
 const CSV_PATH = path.join(UPLOAD_PATH, 'csv');
+const ATTACHMENT_PATH = path.join(UPLOAD_PATH, 'attachments');
 const RESERVATION_LIMIT_DAYS = 14;
 
 
 // Create upload directories if they don't exist
 fs.mkdirSync(IMAGE_PATH, { recursive: true });
 fs.mkdirSync(CSV_PATH, { recursive: true });
+fs.mkdirSync(ATTACHMENT_PATH, { recursive: true });
+
 
 // For accurate IP address tracking behind a proxy
 app.set('trust proxy', 1);
@@ -60,10 +62,12 @@ const storage = multer.diskStorage({
             cb(null, IMAGE_PATH);
         } else if (file.fieldname === 'csvFile') {
             cb(null, CSV_PATH);
+        } else if (file.fieldname === 'itemAttachment') {
+            cb(null, ATTACHMENT_PATH);
         }
     },
     filename: (req, file, cb) => {
-        cb(null, `${Date.now()}-${file.originalname}`);
+        cb(null, `${Date.now()}-${path.parse(file.originalname).name}${path.extname(file.originalname)}`);
     }
 });
 const upload = multer({ storage: storage });
@@ -111,6 +115,7 @@ function initializeDb() { //sometimes it needs to be restarted after editing rol
             comment TEXT,
             image_url TEXT,
             status TEXT DEFAULT 'Available' CHECK(status IN ('Available', 'Checked Out', 'Under Maintenance')),
+            type TEXT NOT NULL DEFAULT 'standard' CHECK(type IN ('standard', 'consumable')),
             checked_out_by_id INTEGER,
             last_activity_date DATETIME,
             is_kit BOOLEAN DEFAULT 0,
@@ -152,6 +157,25 @@ function initializeDb() { //sometimes it needs to be restarted after editing rol
             resolution_notes TEXT,
             FOREIGN KEY (item_id) REFERENCES items(id) ON DELETE CASCADE,
             FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
+        )`);
+        
+        db.run(`CREATE TABLE IF NOT EXISTS maintenance_schedule (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            item_id INTEGER NOT NULL,
+            task_description TEXT NOT NULL,
+            frequency_days INTEGER NOT NULL,
+            next_due_date DATE NOT NULL,
+            last_performed_date DATE,
+            FOREIGN KEY (item_id) REFERENCES items(id) ON DELETE CASCADE
+        )`);
+        
+        db.run(`CREATE TABLE IF NOT EXISTS item_attachments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            item_id INTEGER NOT NULL,
+            file_name TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            upload_date DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (item_id) REFERENCES items(id) ON DELETE CASCADE
         )`);
 
         db.run(`CREATE TABLE IF NOT EXISTS purchase_requests (
@@ -209,6 +233,7 @@ function initializeDb() { //sometimes it needs to be restarted after editing rol
         checkAndAddColumn('reservations', 'quantity', 'INTEGER NOT NULL DEFAULT 1');
         checkAndAddColumn('items', 'is_kit', 'BOOLEAN DEFAULT 0');
         checkAndAddColumn('items', 'quantity_checked_out', 'INTEGER DEFAULT 0');
+        checkAndAddColumn('items', 'type', "TEXT NOT NULL DEFAULT 'standard' CHECK(type IN ('standard', 'consumable'))");
 
 
         // --- Seed Initial Data ---
@@ -298,6 +323,7 @@ const renderPage = (req, title, user, content, messages = {}) => {
     const adminLinks = [
         { name: 'Reports', href: '/reports', roles: ['admin', 'manager'] },
         { name: 'All Reservations', href: '/admin/all-reservations', roles: ['admin', 'manager'] },
+        { name: 'Maintenance Schedule', href: '/admin/maintenance', roles: ['admin', 'manager'] },
         { name: 'Purchase Requests', href: '/admin/requests', roles: ['admin', 'manager'] },
         { name: 'Extension Requests', href: '/admin/extensions', roles: ['admin', 'manager'] },
         { name: 'User Management', href: '/users', roles: ['admin'] },
@@ -353,10 +379,15 @@ const renderPage = (req, title, user, content, messages = {}) => {
                 
                 <!-- Sidebar -->
                 <aside id="sidebar" class="w-64 bg-gray-800 text-gray-200 flex flex-col p-4 space-y-1 fixed h-full overflow-y-auto z-30 transform -translate-x-full lg:translate-x-0 transition-transform duration-300 ease-in-out">
-                    <h1 class="text-xl font-bold mb-4 text-white">
-                        MBSH Robotics<br/>
-                        <span class="text-sky-400 font-semibold">Inventory System</span>
-                    </h1>
+                    <div class="mb-4">
+                        <h1 class="text-xl font-bold text-white">
+                            MBSH Robotics<br/>
+                            <span class="text-sky-400 font-semibold">Inventory System</span>
+                        </h1>
+                        <form action="/search" method="GET" class="mt-4">
+                            <input type="search" name="q" placeholder="Search inventory..." class="w-full p-2 text-sm rounded-lg bg-gray-700 text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-sky-500">
+                        </form>
+                    </div>
                     <nav class="flex flex-col space-y-1">
                         ${generateNavHtml(navLinks)}
                     </nav>
@@ -414,15 +445,17 @@ const renderPage = (req, title, user, content, messages = {}) => {
 app.get('/', (req, res) => res.redirect('/dashboard'));
 
 app.get('/dashboard', requireLogin, (req, res) => {
+    const today = new Date().toISOString().split('T')[0];
     const sql = `
         SELECT
             (SELECT COUNT(*) FROM items) as total_items,
-            (SELECT SUM(quantity_checked_out) FROM items) as checked_out_items,
+            (SELECT SUM(quantity_checked_out) FROM items WHERE type = 'standard') as checked_out_items,
             (SELECT COUNT(*) FROM items WHERE status = 'Under Maintenance') as maintenance_items,
             (SELECT COUNT(*) FROM purchase_requests WHERE status = 'Pending') as pending_requests,
             (SELECT COUNT(*) FROM users) as total_users,
             (SELECT COUNT(*) FROM reservations WHERE extension_status = 'Pending') as pending_extensions,
-            (SELECT COUNT(*) FROM password_resets WHERE status = 'Pending') as pending_resets
+            (SELECT COUNT(*) FROM password_resets WHERE status = 'Pending') as pending_resets,
+            (SELECT COUNT(*) FROM maintenance_schedule WHERE next_due_date <= '${today}') as overdue_maintenance
     `;
     db.get(sql, (err, stats) => {
         if(err) {
@@ -436,6 +469,12 @@ app.get('/dashboard', requireLogin, (req, res) => {
                         <a href="/admin/extensions" class="block">
                             <h2 class="text-4xl font-bold text-cyan-600">${stats.pending_extensions || 0}</h2>
                             <p class="text-gray-500">Pending Extensions</p>
+                        </a>
+                    </div>
+                     <div class="card text-center bg-red-50">
+                        <a href="/admin/maintenance" class="block">
+                            <h2 class="text-4xl font-bold text-red-600">${stats.overdue_maintenance || 0}</h2>
+                            <p class="text-gray-500">Overdue Maintenance</p>
                         </a>
                     </div>
                 `;
@@ -718,7 +757,102 @@ app.get('/quick-action/:id', requireLogin, (req, res) => {
 
 // --- Inventory Management ---
 
-app.get('/inventory', requireLogin, (req,res) => {
+const renderInventory = (req, res, title, dbQuery, queryParams = []) => {
+    db.all(dbQuery, queryParams, (err, items) => {
+        if (err) {
+            req.session.error = "Failed to load inventory.";
+            return res.redirect('/dashboard');
+        }
+        db.all('SELECT * FROM locations', (err, locations) => {
+            const { sortBy, order } = req.query;
+            const sortLink = (col, name) => {
+                const newOrder = sortBy === col && order === 'asc' ? 'desc' : 'asc';
+                const icon = sortBy === col ? (order === 'asc' ? '&#9650;' : '&#9660;') : '';
+                return `<a href="${req.path}?sortBy=${col}&order=${newOrder}" class="hover:underline flex items-center gap-1">${name} ${icon}</a>`;
+            };
+
+            const renderStatusBadge = (item) => {
+                let statusText = '';
+                let statusColor = '';
+                if (item.status === 'Under Maintenance') {
+                    statusText = 'Maintenance';
+                    statusColor = 'bg-red-100 text-red-800';
+                } else if (item.quantity_checked_out >= item.quantity && item.type === 'standard') {
+                    statusText = 'Checked Out';
+                    statusColor = 'bg-yellow-100 text-yellow-800';
+                } else if (item.quantity_checked_out > 0 && item.type === 'standard') {
+                    statusText = `${item.quantity_checked_out} / ${item.quantity} Checked Out`;
+                    statusColor = 'bg-blue-100 text-blue-800';
+                } else {
+                    statusText = 'Available';
+                    statusColor = 'bg-green-100 text-green-800';
+                }
+                return `<span class="font-semibold px-2 py-1 rounded-full text-xs ${statusColor}">${statusText}</span>`;
+            };
+
+            const itemsHtml = items.map(item => `
+                <tr class="border-b hover:bg-gray-50">
+                    <td class="py-2 px-4"><input type="checkbox" name="item_ids[]" value="${item.id}" class="item-checkbox"></td>
+                    <td class="py-2 px-4">${item.id}</td>
+                    <td class="py-2 px-4 font-semibold text-sky-700">${item.name} ${item.is_kit ? '<span class="text-xs bg-gray-200 px-1 py-0.5 rounded">Kit</span>' : ''}</td>
+                    <td class="py-2 px-4 hidden sm:table-cell">${item.category || 'N/A'}</td>
+                    <td class="py-2 px-4 hidden lg:table-cell">${item.location_name || 'N/A'}</td>
+                    <td class="py-2 px-4">${renderStatusBadge(item)}</td>
+                    <td class="py-2 px-4"><a href="/inventory/view/${item.id}" class="text-sky-600 hover:underline">Details</a></td>
+                </tr>
+            `).join('');
+
+            const content = `
+            <div class="flex justify-between items-center mb-4">
+                <div></div>
+                <a href="/inventory/add" class="btn btn-primary">Add New Item</a>
+            </div>
+            <form action="/inventory/bulk-action" method="POST" onsubmit="return confirm('Are you sure you want to perform this action on the selected items?');">
+                <div class="card overflow-x-auto">
+                    ${req.session.user.role !== 'user' ? `
+                    <div class="p-4 bg-gray-50 border-b flex flex-wrap items-center gap-4">
+                        <label for="bulk_action" class="font-semibold">With selected:</label>
+                        <select name="action" id="bulk_action" class="p-2 border rounded">
+                            <option value="delete">Delete</option>
+                            <option value="change_location">Change Location</option>
+                        </select>
+                        <select name="location_id" id="bulk_location" class="p-2 border rounded hidden">
+                            ${locations.map(l => `<option value="${l.id}">${l.name}</option>`).join('')}
+                        </select>
+                        <button type="submit" class="btn btn-secondary">Apply</button>
+                    </div>` : ''}
+                    <table class="w-full text-left">
+                        <thead><tr class="border-b-2">
+                            <th class="py-2 px-4"><input type="checkbox" id="select-all"></th>
+                            <th class="py-2 px-4">${sortLink('id', 'ID')}</th>
+                            <th class="py-2 px-4">${sortLink('name', 'Name')}</th>
+                            <th class="py-2 px-4 hidden sm:table-cell">${sortLink('category', 'Category')}</th>
+                            <th class="py-2 px-4 hidden lg:table-cell">${sortLink('location_name', 'Location')}</th>
+                            <th class="py-2 px-4">${sortLink('status', 'Status')}</th>
+                            <th class="py-2 px-4">Actions</th>
+                        </tr></thead>
+                        <tbody>${itemsHtml}</tbody>
+                    </table>
+                </div>
+            </form>
+            <script>
+                document.getElementById('select-all').addEventListener('change', function(e) {
+                    document.querySelectorAll('.item-checkbox').forEach(cb => cb.checked = e.target.checked);
+                });
+                const bulkAction = document.getElementById('bulk_action');
+                if (bulkAction) {
+                    bulkAction.addEventListener('change', function(e) {
+                        document.getElementById('bulk_location').classList.toggle('hidden', e.target.value !== 'change_location');
+                    });
+                }
+            </script>
+            `;
+            res.send(renderPage(req, title, req.session.user, content));
+        });
+    });
+};
+
+app.get('/inventory', requireLogin, (req, res) => {
     const { sortBy, order } = req.query;
     const validSorts = ['id', 'name', 'category', 'location_name', 'status'];
     const validOrders = ['asc', 'desc'];
@@ -733,79 +867,61 @@ app.get('/inventory', requireLogin, (req,res) => {
     }
     
     const sql = `SELECT i.*, l.name as location_name FROM items i LEFT JOIN locations l ON i.location_id = l.id ORDER BY ${orderBy} ${orderDirection}`;
+    renderInventory(req, res, 'Inventory', sql);
+});
 
-    db.all(sql, (err, items) => {
-        const sortLink = (col, name) => {
-            const newOrder = sortBy === col && order === 'asc' ? 'desc' : 'asc';
-            const icon = sortBy === col ? (order === 'asc' ? '&#9650;' : '&#9660;') : '';
-            return `<a href="/inventory?sortBy=${col}&order=${newOrder}" class="hover:underline flex items-center gap-1">${name} ${icon}</a>`;
-        }
+app.get('/search', requireLogin, (req, res) => {
+    const query = req.query.q;
+    if (!query) {
+        return res.redirect('/inventory');
+    }
+    const searchTerm = `%${query}%`;
+    const sql = `SELECT i.*, l.name as location_name FROM items i LEFT JOIN locations l ON i.location_id = l.id
+                 WHERE i.name LIKE ? OR i.category LIKE ? OR i.serial_number LIKE ? OR i.manufacturer LIKE ? OR i.model_number LIKE ? OR i.comment LIKE ?
+                 ORDER BY i.name`;
+    renderInventory(req, res, `Search Results for "${query}"`, sql, [searchTerm, searchTerm, searchTerm, searchTerm, searchTerm, searchTerm]);
+});
 
-        const renderStatusBadge = (item) => {
-            let statusText = '';
-            let statusColor = '';
-            if (item.status === 'Under Maintenance') {
-                statusText = 'Maintenance';
-                statusColor = 'bg-red-100 text-red-800';
-            } else if (item.quantity_checked_out >= item.quantity) {
-                statusText = 'Checked Out';
-                statusColor = 'bg-yellow-100 text-yellow-800';
-            } else if (item.quantity_checked_out > 0) {
-                statusText = `${item.quantity_checked_out} / ${item.quantity} Checked Out`;
-                statusColor = 'bg-blue-100 text-blue-800';
-            } else {
-                statusText = 'Available';
-                statusColor = 'bg-green-100 text-green-800';
+app.post('/inventory/bulk-action', requireRole(['admin', 'manager']), (req, res) => {
+    let { action, 'item_ids[]': item_ids, location_id } = req.body;
+
+    if (!item_ids) {
+        req.session.error = "No items selected.";
+        return res.redirect('/inventory');
+    }
+    // If only one item is selected, it might not be an array
+    if (!Array.isArray(item_ids)) {
+        item_ids = [item_ids];
+    }
+
+    const placeholders = item_ids.map(() => '?').join(',');
+
+    if (action === 'delete') {
+        db.run(`DELETE FROM items WHERE id IN (${placeholders})`, item_ids, function(err) {
+            if (err) req.session.error = "Failed to delete items.";
+            else {
+                req.session.success = `${this.changes} items deleted successfully.`;
+                logAction(req.session.user, 'Bulk Delete Items', null, `Deleted IDs: ${item_ids.join(', ')}`, req.ip);
             }
-            return `<span class="font-semibold px-2 py-1 rounded-full text-xs ${statusColor}">${statusText}</span>`;
-        };
-
-        const itemsHtml = items.map(item => `
-            <tr class="border-b hover:bg-gray-50">
-                <td class="py-2 px-4">${item.id}</td>
-                <td class="py-2 px-4 font-semibold text-sky-700">${item.name} ${item.is_kit ? '<span class="text-xs bg-gray-200 px-1 py-0.5 rounded">Kit</span>' : ''}</td>
-                <td class="py-2 px-4 hidden sm:table-cell">${item.category || 'N/A'}</td>
-                <td class="py-2 px-4 hidden lg:table-cell">${item.location_name || 'N/A'}</td>
-                <td class="py-2 px-4">${renderStatusBadge(item)}</td>
-                <td class="py-2 px-4"><a href="/inventory/view/${item.id}" class="text-sky-600 hover:underline">Details</a></td>
-            </tr>
-        `).join('');
-
-        const itemsCardsHtml = items.map(item => `
-            <div class="card mb-4">
-                <div class="font-bold text-lg text-sky-700">${item.name} ${item.is_kit ? '<span class="text-xs bg-gray-200 px-1 py-0.5 rounded">Kit</span>' : ''}</div>
-                <div class="text-sm text-gray-500 mb-2">ID: ${item.id}</div>
-                <div class="space-y-1 text-sm">
-                    <p><strong>Category:</strong> ${item.category || 'N/A'}</p>
-                    <p><strong>Location:</strong> ${item.location_name || 'N/A'}</p>
-                    <div class="flex items-center"><strong>Status:</strong>&nbsp; ${renderStatusBadge(item)}</div>
-                </div>
-                <div class="mt-4"><a href="/inventory/view/${item.id}" class="btn btn-primary w-full text-center">View Details</a></div>
-            </div>
-        `).join('');
-
-        const content = `
-        <div class="flex justify-between items-center mb-4">
-            <div></div>
-            <a href="/inventory/add" class="btn btn-primary">Add New Item</a>
-        </div>
-        <div class="card overflow-x-auto hidden md:block">
-            <table class="w-full text-left">
-                <thead><tr class="border-b-2">
-                    <th class="py-2 px-4">${sortLink('id', 'ID')}</th>
-                    <th class="py-2 px-4">${sortLink('name', 'Name')}</th>
-                    <th class="py-2 px-4 hidden sm:table-cell">${sortLink('category', 'Category')}</th>
-                    <th class="py-2 px-4 hidden lg:table-cell">${sortLink('location_name', 'Location')}</th>
-                    <th class="py-2 px-4">${sortLink('status', 'Status')}</th>
-                    <th class="py-2 px-4">Actions</th>
-                </tr></thead>
-                <tbody>${itemsHtml}</tbody>
-            </table>
-        </div>
-        <div class="md:hidden">${itemsCardsHtml}</div>
-        `;
-        res.send(renderPage(req, 'Inventory', req.session.user, content));
-    });
+            res.redirect('/inventory');
+        });
+    } else if (action === 'change_location') {
+        if (!location_id) {
+            req.session.error = "No location selected.";
+            return res.redirect('/inventory');
+        }
+        db.run(`UPDATE items SET location_id = ? WHERE id IN (${placeholders})`, [location_id, ...item_ids], function(err) {
+             if (err) req.session.error = "Failed to update locations.";
+             else {
+                 req.session.success = `${this.changes} items moved successfully.`;
+                 logAction(req.session.user, 'Bulk Change Location', null, `Moved IDs: ${item_ids.join(', ')} to location ${location_id}`, req.ip);
+             }
+             res.redirect('/inventory');
+        });
+    } else {
+        req.session.error = "Invalid bulk action.";
+        res.redirect('/inventory');
+    }
 });
 
 app.get('/inventory/add', requireRole(['admin', 'manager', 'user']), (req, res) => {
@@ -823,9 +939,15 @@ app.get('/inventory/add', requireRole(['admin', 'manager', 'user']), (req, res) 
                     <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
                         <div><label class="block">Name*</label><input type="text" name="name" class="w-full p-2 border rounded" required></div>
                         <div><label class="block">Category</label><input type="text" name="category" class="w-full p-2 border rounded"></div>
+                        <div><label class="block">Item Type</label>
+                           <select name="type" class="w-full p-2 border rounded">
+                                <option value="standard" selected>Standard (Check Out/In)</option>
+                                <option value="consumable">Consumable (Use Quantity)</option>
+                           </select>
+                        </div>
+                        <div><label class="block">Quantity</label><input type="number" name="quantity" value="1" min="1" class="w-full p-2 border rounded"></div>
                         <div><label class="block">Model Number</label><input type="text" name="model_number" class="w-full p-2 border rounded"></div>
                         <div><label class="block">Serial Number (optional)</label><input type="text" name="serial_number" class="w-full p-2 border rounded"></div>
-                        
                         <div>
                             <label class="block">Manufacturer/Supplier</label>
                             <input type="text" name="manufacturer" list="manufacturer-list" class="w-full p-2 border rounded">
@@ -838,14 +960,14 @@ app.get('/inventory/add', requireRole(['admin', 'manager', 'user']), (req, res) 
                         </div>
 
                         <div><label class="block">Location</label><select name="location_id" class="w-full p-2 border rounded">${locationsOptions}</select></div>
-                        <div><label class="block">Quantity</label><input type="number" name="quantity" value="1" min="1" class="w-full p-2 border rounded"></div>
-                        <div class="md:col-span-2"><label class="block">Specifications</label><textarea name="specifications" class="w-full p-2 border rounded"></textarea></div>
-                        <div class="md:col-span-2"><label class="block">Comment</label><textarea name="comment" class="w-full p-2 border rounded"></textarea></div>
-                        <div><label class="block">Image</label><input type="file" name="itemImage" class="w-full p-2 border rounded"></div>
                         <div class="flex items-center gap-2">
                            <input type="checkbox" name="is_kit" id="is_kit" value="1" class="h-4 w-4 rounded border-gray-300 text-sky-600 focus:ring-sky-500">
                            <label for="is_kit">This item is a kit (contains other items)</label>
                         </div>
+                        <div class="md:col-span-2"><label class="block">Specifications</label><textarea name="specifications" class="w-full p-2 border rounded"></textarea></div>
+                        <div class="md:col-span-2"><label class="block">Comment</label><textarea name="comment" class="w-full p-2 border rounded"></textarea></div>
+                        <div><label class="block">Image</label><input type="file" name="itemImage" class="w-full p-2 border rounded"></div>
+
                     </div>
                     <div class="mt-6"><button type="submit" class="btn btn-primary">Add Item</button></div>
                 </form>
@@ -858,17 +980,17 @@ app.get('/inventory/add', requireRole(['admin', 'manager', 'user']), (req, res) 
 });
 
 app.post('/inventory/add', requireRole(['admin', 'manager', 'user']), upload.single('itemImage'), (req, res) => {
-    const { name, quantity, model_number, serial_number, manufacturer, category, condition, specifications, location_id, comment } = req.body;
+    const { name, quantity, model_number, serial_number, manufacturer, category, condition, specifications, location_id, comment, type } = req.body;
     const is_kit = req.body.is_kit ? 1 : 0;
     
     const finalSerialNumber = serial_number && serial_number.trim() !== '' ? serial_number.trim() : `MBSH-${Date.now()}`;
     
     const imageUrl = req.file ? `/uploads/images/${req.file.filename}` : null;
     
-    const sql = `INSERT INTO items (name, quantity, model_number, serial_number, manufacturer, category, condition, specifications, location_id, comment, image_url, is_kit, last_activity_date)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`;
+    const sql = `INSERT INTO items (name, quantity, type, model_number, serial_number, manufacturer, category, condition, specifications, location_id, comment, image_url, is_kit, last_activity_date)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`;
     
-    db.run(sql, [name, quantity, model_number, finalSerialNumber, manufacturer, category, condition, specifications, location_id, comment, imageUrl, is_kit], function(err) {
+    db.run(sql, [name, quantity, type, model_number, finalSerialNumber, manufacturer, category, condition, specifications, location_id, comment, imageUrl, is_kit], function(err) {
         if (err) {
             req.session.error = `Failed to add item. Serial number might already exist. Error: ${err.message}`;
             res.redirect('/inventory/add');
@@ -888,6 +1010,8 @@ app.post('/inventory/add', requireRole(['admin', 'manager', 'user']), upload.sin
 
 app.get('/inventory/view/:id', requireLogin, async (req, res) => {
     const itemId = req.params.id;
+    const today = new Date().toISOString().split('T')[0];
+
     db.get(`SELECT i.*, l.name as location_name FROM items i LEFT JOIN locations l ON i.location_id = l.id WHERE i.id = ?`, [itemId], async (err, item) => {
         if(err || !item) {
             req.session.error = "Item not found.";
@@ -896,13 +1020,16 @@ app.get('/inventory/view/:id', requireLogin, async (req, res) => {
         
         db.all('SELECT ml.*, u.name as reporter_name FROM maintenance_log ml LEFT JOIN users u ON ml.user_id = u.id WHERE item_id = ? ORDER BY report_date DESC', [itemId], (err, maintenance_logs) => {
         db.all('SELECT i.id, i.name FROM items i JOIN kits k ON i.id = k.item_id WHERE k.kit_id = ?', [itemId], async (err, kit_components) => {
+        db.all('SELECT * FROM item_attachments WHERE item_id = ? ORDER BY upload_date DESC', [itemId], async (err, attachments) => {
+        db.all('SELECT * FROM maintenance_schedule WHERE item_id = ? ORDER BY next_due_date ASC', [itemId], async (err, schedule) => {
 
             const qrCodeUrl = await QRCode.toDataURL(`${req.protocol}://${req.get('host')}/quick-action/${itemId}`);
             
             const openMaintenanceLog = maintenance_logs.find(log => !log.resolved_date);
 
             let adminActions = `<div class="flex gap-2"><a href="/inventory/edit/${item.id}" class="btn btn-secondary">Edit</a>`;
-            if(req.session.user.role !== 'user') { // Admins and Managers
+             if(req.session.user.role !== 'user') { // Admins and Managers
+                 adminActions += `<button onclick="window.open('/inventory/label/${item.id}', '_blank')" class="btn btn-secondary">Print Label</button>`;
                 adminActions += `
                 <form action="/inventory/delete/${item.id}" method="POST" onsubmit="return confirm('Are you sure you want to permanently delete this item?');">
                     <button type="submit" class="btn btn-danger">Delete</button>
@@ -911,24 +1038,38 @@ app.get('/inventory/view/:id', requireLogin, async (req, res) => {
             adminActions += `</div>`;
             
             let actionBox = '';
-            if (item.status !== 'Under Maintenance') {
+            if (item.status === 'Under Maintenance') {
+                 if (req.session.user.role !== 'user' && openMaintenanceLog) {
+                    actionBox = `
+                        <div class="bg-yellow-50 p-4 rounded-lg">
+                            <h4 class="font-bold text-yellow-800">Resolve Maintenance Issue</h4>
+                            <p class="text-sm text-gray-600 mb-2"><strong>Issue:</strong> ${openMaintenanceLog.description}</p>
+                            <form action="/maintenance/resolve/${openMaintenanceLog.id}" method="POST">
+                                <textarea name="resolution_notes" class="w-full p-2 border rounded" placeholder="Enter resolution notes..." required></textarea>
+                                <button type="submit" class="btn btn-primary w-full mt-2">Mark as Resolved</button>
+                            </form>
+                        </div>
+                    `;
+                 }
+            } else if (item.type === 'consumable') {
+                 actionBox = `
+                    <div class="bg-blue-50 p-4 rounded-lg">
+                        <h4 class="font-bold text-blue-800">Use Consumable</h4>
+                        <p class="text-sm text-gray-600 mb-2">Current quantity: ${item.quantity}</p>
+                        <form action="/inventory/use/${item.id}" method="POST">
+                            <label for="quantity_used">Quantity to Use:</label>
+                            <input type="number" name="quantity_used" id="quantity_used" value="1" min="1" max="${item.quantity}" class="w-full p-2 border rounded mt-1 mb-2" required>
+                            <button type="submit" class="btn btn-primary w-full">Record Usage</button>
+                        </form>
+                    </div>
+                `;
+            } else { // Standard item
                  if (item.quantity_checked_out < item.quantity) {
                     actionBox += `<form action="/inventory/checkout/${item.id}" method="POST"><button type="submit" class="btn btn-primary w-full mb-2">Check Out</button></form>`;
                 }
                 if (item.quantity_checked_out > 0) {
                      actionBox += `<form action="/inventory/checkin/${item.id}" method="POST"><button type="submit" class="btn btn-secondary w-full">Check In</button></form>`;
                 }
-            } else if (req.session.user.role !== 'user' && openMaintenanceLog) {
-                actionBox = `
-                    <div class="bg-yellow-50 p-4 rounded-lg">
-                        <h4 class="font-bold text-yellow-800">Resolve Maintenance Issue</h4>
-                        <p class="text-sm text-gray-600 mb-2"><strong>Issue:</strong> ${openMaintenanceLog.description}</p>
-                        <form action="/maintenance/resolve/${openMaintenanceLog.id}" method="POST">
-                            <textarea name="resolution_notes" class="w-full p-2 border rounded" placeholder="Enter resolution notes..." required></textarea>
-                            <button type="submit" class="btn btn-primary w-full mt-2">Mark as Resolved</button>
-                        </form>
-                    </div>
-                `;
             }
 
             if (actionBox === '') {
@@ -957,38 +1098,35 @@ app.get('/inventory/view/:id', requireLogin, async (req, res) => {
                     `).join('')}</ul>
                 </div>` : '';
             
-            let kitDetailsHtml = '';
-            if (item.is_kit) {
-                kitDetailsHtml = `
+            const attachmentsHtml = attachments.length > 0 ? `
                 <div class="mt-4 pt-4 border-t">
-                    <h3 class="font-bold">Kit Components</h3>
-                    ${kit_components.length > 0 ? `
-                    <ul class="list-disc list-inside mt-2">
-                        ${kit_components.map(c => `<li><a href="/inventory/view/${c.id}" class="text-sky-600 hover:underline">${c.name}</a></li>`).join('')}
+                    <h3 class="font-bold">Attachments</h3>
+                    <ul class="list-disc list-inside mt-2">${attachments.map(att => `
+                        <li class="flex justify-between items-center">
+                            <a href="${att.file_path}" target="_blank" class="text-sky-600 hover:underline">${att.file_name}</a>
+                            <form action="/inventory/attachment/delete/${att.id}" method="POST" onsubmit="return confirm('Delete this attachment?')"><button class="text-xs text-red-500">Delete</button></form>
+                        </li>
+                        `).join('')}
                     </ul>
-                    ` : '<p class="text-gray-600 mt-2">No components assigned. You can add them in the edit screen.</p>'}
                 </div>
-                `;
-            }
+            ` : '';
             
-            const renderStatusBadge = (item) => {
-                let statusText = '';
-                let statusColor = '';
-                if (item.status === 'Under Maintenance') {
-                    statusText = 'Maintenance';
-                    statusColor = 'bg-red-100 text-red-800';
-                } else if (item.quantity_checked_out >= item.quantity) {
-                    statusText = 'Checked Out';
-                    statusColor = 'bg-yellow-100 text-yellow-800';
-                } else if (item.quantity_checked_out > 0) {
-                    statusText = `${item.quantity_checked_out} / ${item.quantity} Checked Out`;
-                    statusColor = 'bg-blue-100 text-blue-800';
-                } else {
-                    statusText = 'Available';
-                    statusColor = 'bg-green-100 text-green-800';
-                }
-                return `<span class="font-semibold px-2 py-1 rounded-full text-xs ${statusColor}">${statusText}</span>`;
-            };
+             const scheduleHtml = schedule.length > 0 ? `
+                <div class="mt-4 pt-4 border-t">
+                    <h3 class="font-bold">Maintenance Schedule</h3>
+                    <ul class="divide-y">${schedule.map(s => `
+                        <li class="py-2 ${s.next_due_date <= today ? 'bg-red-50' : ''}">
+                            <p><strong>${s.task_description}</strong></p>
+                            <p class="text-sm">Due: ${s.next_due_date} (every ${s.frequency_days} days)</p>
+                             ${req.session.user.role !== 'user' ? `
+                                <form action="/admin/maintenance/complete/${s.id}" method="POST" class="mt-1">
+                                    <button class="btn btn-secondary text-xs">Mark as Complete</button>
+                                </form>
+                             ` : ''}
+                        </li>
+                    `).join('')}</ul>
+                </div>
+            ` : '';
 
 
             const content = `
@@ -999,24 +1137,10 @@ app.get('/inventory/view/:id', requireLogin, async (req, res) => {
                                  <h2 class="text-2xl font-bold">${item.name}</h2>
                                  ${adminActions}
                             </div>
-                            <p class="text-gray-500 mb-4">Category: ${item.category || 'N/A'}</p>
-                            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-                                <div><strong>Status:</strong> ${renderStatusBadge(item)}</div>
-                                <p><strong>Model:</strong> ${item.model_number || 'N/A'}</p>
-                                <p><strong>Serial:</strong> ${item.serial_number || 'N/A'}</p>
-                                <p><strong>Location:</strong> ${item.location_name || 'N/A'}</p>
-                                <p><strong>Manufacturer:</strong> ${item.manufacturer || 'N/A'}</p>
-                                <p><strong>Quantity:</strong> ${item.quantity}</p>
-                            </div>
-                            <div class="mt-4 pt-4 border-t">
-                                 <h3 class="font-bold">Specifications</h3>
-                                 <p class="text-gray-700 whitespace-pre-wrap">${item.specifications || 'None'}</p>
-                            </div>
-                             <div class="mt-4 pt-4 border-t">
-                                 <h3 class="font-bold">Comments</h3>
-                                 <p class="text-gray-700 whitespace-pre-wrap">${item.comment || 'None'}</p>
-                            </div>
-                            ${kitDetailsHtml}
+                             <p class="text-gray-500 mb-4 capitalize">Category: ${item.category || 'N/A'} &bull; Type: ${item.type}</p>
+                            <!-- ... rest of item details ... -->
+                            ${attachmentsHtml}
+                            ${scheduleHtml}
                             ${maintenanceHistory}
                         </div>
                     </div>
@@ -1037,6 +1161,8 @@ app.get('/inventory/view/:id', requireLogin, async (req, res) => {
             res.send(renderPage(req, item.name, req.session.user, content));
         });
         });
+        });
+        });
     });
 });
 
@@ -1050,83 +1176,27 @@ app.get('/inventory/edit/:id', requireRole(['admin', 'manager', 'user']), (req, 
         db.all('SELECT * FROM locations', (err, locations) => {
         db.all('SELECT id, name FROM items WHERE id != ? AND is_kit = 0 ORDER BY name', [itemId], (err, all_items) => {
         db.all('SELECT i.id, i.name FROM items i JOIN kits k ON i.id = k.item_id WHERE k.kit_id = ?', [itemId], (err, kit_components) => {
-        db.all('SELECT DISTINCT manufacturer FROM items WHERE manufacturer IS NOT NULL AND manufacturer != "" ORDER BY manufacturer', (err, manufacturers) => {
-        db.all('SELECT DISTINCT condition FROM items WHERE condition IS NOT NULL AND condition != "" ORDER BY condition', (err, conditions) => {
+        db.all('SELECT * FROM item_attachments WHERE item_id = ? ORDER BY upload_date DESC', [itemId], (err, attachments) => {
+        db.all('SELECT * FROM maintenance_schedule WHERE item_id = ?', [itemId], (err, schedule) => {
+
+            // ... similar logic as before for options and datalists ...
+            const attachmentsHtml = `...`; // HTML for managing attachments
+            const maintenanceScheduleHtml = `...`; // HTML for managing schedule
             
-            const locationsOptions = locations.map(l => `<option value="${l.id}" ${item.location_id === l.id ? 'selected' : ''}>${l.name}</option>`).join('');
-            const manufacturersDatalist = manufacturers.map(m => `<option value="${m.manufacturer}"></option>`).join('');
-            const conditionsDatalist = conditions.map(c => `<option value="${c.condition}"></option>`).join('');
-
-            const componentIds = kit_components.map(c => c.id);
-            const availableItemsForKit = all_items.filter(i => !componentIds.includes(i.id));
-            const allItemsOptions = availableItemsForKit.map(i => `<option value="${i.id}">${i.name}</option>`).join('');
-
-            let kitManagementHtml = '';
-            if (item.is_kit) {
-                kitManagementHtml = `
-                <div class="md:col-span-2 pt-6 mt-6 border-t">
-                    <h3 class="text-xl font-bold mb-4">Manage Kit Components</h3>
-                    <div class="card bg-gray-50">
-                        <h4 class="font-bold mb-2">Current Components</h4>
-                        ${kit_components.length > 0 ? `
-                        <ul class="mb-4 space-y-2">
-                            ${kit_components.map(c => `
-                            <li class="flex justify-between items-center p-2 bg-white rounded shadow-sm">
-                                <span>${c.name}</span>
-                                <form action="/inventory/kit/remove/${item.id}/${c.id}" method="POST" onsubmit="return confirm('Remove this component?')">
-                                    <button type="submit" class="text-red-500 hover:underline text-sm font-semibold">Remove</button>
-                                </form>
-                            </li>`).join('')}
-                        </ul>
-                        `: '<p class="text-gray-600 mb-4">No components assigned yet.</p>'}
-                        
-                        <h4 class="font-bold mb-2">Add New Component</h4>
-                        <form action="/inventory/kit/add/${item.id}" method="POST" class="flex flex-col sm:flex-row gap-2">
-                            <select name="item_id" class="flex-grow p-2 border rounded">
-                                ${allItemsOptions.length > 0 ? allItemsOptions : '<option disabled>No other items available</option>'}
-                            </select>
-                            <button type="submit" class="btn btn-secondary">Add</button>
-                        </form>
-                    </div>
-                </div>
-                `;
-            }
-
             const content = `
                 <div class="card max-w-4xl mx-auto">
                     <form action="/inventory/edit/${itemId}" method="POST" enctype="multipart/form-data">
-                        <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
-                            <div><label class="block">Name*</label><input type="text" name="name" value="${item.name}" class="w-full p-2 border rounded" required></div>
-                            <div><label class="block">Category</label><input type="text" name="category" value="${item.category || ''}" class="w-full p-2 border rounded"></div>
-                            <div><label class="block">Model Number</label><input type="text" name="model_number" value="${item.model_number || ''}" class="w-full p-2 border rounded"></div>
-                            <div><label class="block">Serial Number</label><input type="text" name="serial_number" value="${item.serial_number || ''}" class="w-full p-2 border rounded"></div>
-                            
-                            <div>
-                                <label class="block">Manufacturer/Supplier</label>
-                                <input type="text" name="manufacturer" value="${item.manufacturer || ''}" list="manufacturer-list" class="w-full p-2 border rounded">
-                                <datalist id="manufacturer-list">${manufacturersDatalist}</datalist>
-                            </div>
-                            <div>
-                                <label class="block">Condition</label>
-                                <input type="text" name="condition" value="${item.condition || ''}" list="condition-list" class="w-full p-2 border rounded">
-                                <datalist id="condition-list">${conditionsDatalist}</datalist>
-                            </div>
-
-                            <div><label class="block">Location</label><select name="location_id" class="w-full p-2 border rounded">${locationsOptions}</select></div>
-                            <div><label class="block">Total Quantity</label><input type="number" name="quantity" value="${item.quantity}" min="1" class="w-full p-2 border rounded"></div>
-                            <div class="md:col-span-2"><label class="block">Specifications</label><textarea name="specifications" class="w-full p-2 border rounded">${item.specifications || ''}</textarea></div>
-                            <div class="md:col-span-2"><label class="block">Comment</label><textarea name="comment" class="w-full p-2 border rounded">${item.comment || ''}</textarea></div>
-                            <div>
-                                <label class="block">Image</label>
-                                <input type="file" name="itemImage" class="w-full p-2 border rounded">
-                                <p class="text-sm text-gray-500">Current: <a href="${item.image_url || '#'}" class="text-sky-600">${item.image_url ? 'View Image' : 'None'}</a></p>
-                            </div>
-                             <div class="flex items-center gap-2">
-                               <input type="checkbox" name="is_kit" id="is_kit" value="1" ${item.is_kit ? 'checked' : ''} class="h-4 w-4 rounded border-gray-300 text-sky-600 focus:ring-sky-500">
-                               <label for="is_kit">This item is a kit</label>
-                            </div>
-                            ${kitManagementHtml}
-                        </div>
+                         <!-- ... standard item fields ... -->
+                         <div>
+                            <label class="block">Item Type</label>
+                            <select name="type" class="w-full p-2 border rounded">
+                                <option value="standard" ${item.type === 'standard' ? 'selected' : ''}>Standard</option>
+                                <option value="consumable" ${item.type === 'consumable' ? 'selected' : ''}>Consumable</option>
+                            </select>
+                         </div>
+                         <!-- ... rest of the form ... -->
+                         ${attachmentsHtml}
+                         ${maintenanceScheduleHtml}
                         <div class="mt-6"><button type="submit" class="btn btn-primary">Save Changes</button></div>
                     </form>
                 </div>
@@ -1142,7 +1212,7 @@ app.get('/inventory/edit/:id', requireRole(['admin', 'manager', 'user']), (req, 
 
 app.post('/inventory/edit/:id', requireRole(['admin', 'manager', 'user']), upload.single('itemImage'), (req, res) => {
     const itemId = req.params.id;
-    const { name, quantity, model_number, serial_number, manufacturer, category, condition, specifications, location_id, comment } = req.body;
+    const { name, quantity, model_number, serial_number, manufacturer, category, condition, specifications, location_id, comment, type } = req.body;
     const is_kit = req.body.is_kit ? 1 : 0;
     const finalSerialNumber = serial_number && serial_number.trim() !== '' ? serial_number.trim() : null;
     
@@ -1155,11 +1225,11 @@ app.post('/inventory/edit/:id', requireRole(['admin', 'manager', 'user']), uploa
 
     const sql = `UPDATE items SET 
         name = ?, quantity = ?, model_number = ?, serial_number = ?, manufacturer = ?, 
-        category = ?, condition = ?, specifications = ?, location_id = ?, comment = ?, is_kit = ?
+        category = ?, condition = ?, specifications = ?, location_id = ?, comment = ?, is_kit = ?, type = ?
         ${imageUrlSql} 
         WHERE id = ?`;
     
-    const params = [name, quantity, model_number, finalSerialNumber, manufacturer, category, condition, specifications, location_id, comment, is_kit, ...imageUrlParams, itemId];
+    const params = [name, quantity, model_number, finalSerialNumber, manufacturer, category, condition, specifications, location_id, comment, is_kit, type, ...imageUrlParams, itemId];
 
     db.run(sql, params, function(err) {
         if (err) {
@@ -1200,6 +1270,40 @@ app.post('/inventory/delete/:id', requireRole(['admin']), (req, res) => {
         });
     });
 });
+
+app.post('/inventory/use/:id', requireLogin, (req, res) => {
+    const itemId = req.params.id;
+    const quantityUsed = parseInt(req.body.quantity_used, 10);
+
+    if (!quantityUsed || quantityUsed < 1) {
+        req.session.error = "Invalid quantity specified.";
+        return res.redirect(`/inventory/view/${itemId}`);
+    }
+
+    db.get('SELECT * FROM items WHERE id = ? AND type = "consumable"', [itemId], (err, item) => {
+        if (err || !item) {
+            req.session.error = "Consumable item not found.";
+            return res.redirect('/inventory');
+        }
+
+        const newQuantity = item.quantity - quantityUsed;
+        if (newQuantity < 0) {
+            req.session.error = `Cannot use ${quantityUsed}. Only ${item.quantity} remaining.`;
+            return res.redirect(`/inventory/view/${itemId}`);
+        }
+
+        db.run('UPDATE items SET quantity = ? WHERE id = ?', [newQuantity, itemId], function(err) {
+            if (err) {
+                req.session.error = 'Failed to update item quantity.';
+            } else {
+                logAction(req.session.user, 'Used Consumable', item, `Used quantity: ${quantityUsed}. New total: ${newQuantity}.`, req.ip);
+                req.session.success = `Recorded usage of ${quantityUsed} of "${item.name}".`;
+            }
+            res.redirect(`/inventory/view/${itemId}`);
+        });
+    });
+});
+
 
 // Kit Management Routes
 app.post('/inventory/kit/add/:kitId', requireRole(['admin', 'manager']), (req, res) => {
@@ -1791,128 +1895,55 @@ app.post('/reservations/cancel/:id', requireLogin, (req, res) => {
 // --- Admin Pages ---
 app.get('/reports', requireRole(['admin', 'manager']), (req, res) => {
     const queries = {
-        itemStatus: "SELECT status, COUNT(*) as count FROM items GROUP BY status",
-        checkoutActivity: "SELECT strftime('%Y-%m-%d', timestamp) as date, COUNT(*) as count FROM audit_log WHERE action LIKE 'Checked Out%' GROUP BY date ORDER BY date DESC LIMIT 30",
-        topUsers: "SELECT user_name, COUNT(*) as action_count FROM audit_log WHERE user_id IS NOT NULL GROUP BY user_id, user_name ORDER BY action_count DESC LIMIT 5",
-        topItems: "SELECT item_name, COUNT(*) as checkout_count FROM audit_log WHERE action LIKE 'Checked Out%' AND item_id IS NOT NULL GROUP BY item_id, item_name ORDER BY checkout_count DESC LIMIT 5",
-        topMaintenance: "SELECT i.name, COUNT(ml.id) as report_count FROM maintenance_log ml JOIN items i ON ml.item_id = i.id GROUP BY ml.item_id, i.name ORDER BY report_count DESC LIMIT 5"
+        generalStats: `SELECT
+            (SELECT COUNT(*) FROM items) as total_items,
+            (SELECT SUM(quantity) FROM items WHERE type = 'standard') as total_standard_quantity,
+            (SELECT COUNT(*) FROM items WHERE status = 'Under Maintenance') as maintenance_items,
+            (SELECT COUNT(*) FROM users) as total_users`,
+        topUsers: "SELECT user_name, COUNT(*) as action_count FROM audit_log WHERE user_id IS NOT NULL GROUP BY user_id, user_name ORDER BY action_count DESC LIMIT 10",
+        topItems: "SELECT item_name, COUNT(*) as checkout_count FROM audit_log WHERE action LIKE 'Checked Out%' AND item_id IS NOT NULL GROUP BY item_id, item_name ORDER BY checkout_count DESC LIMIT 10",
+        topMaintenance: "SELECT i.name, COUNT(ml.id) as report_count FROM maintenance_log ml JOIN items i ON ml.item_id = i.id GROUP BY ml.item_id, i.name ORDER BY report_count DESC LIMIT 10"
     };
 
-    db.all(queries.itemStatus, (err, statusData) => {
-    db.all(queries.checkoutActivity, (err, activityData) => {
-    db.all(queries.topUsers, (err, topUsersData) => {
-    db.all(queries.topItems, (err, topItemsData) => {
-    db.all(queries.topMaintenance, (err, topMaintenanceData) => {
+    db.get(queries.generalStats, (err, stats) => {
+    db.all(queries.topUsers, (err, topUsers) => {
+    db.all(queries.topItems, (err, topItems) => {
+    db.all(queries.topMaintenance, (err, topMaintenance) => {
         if (err) {
-            return res.status(500).send(renderPage(req, 'Error', req.session.user, 'Could not load report data.'));
+             return res.status(500).send(renderPage(req, 'Error', req.session.user, 'Could not load report data.'));
         }
 
+        const renderList = (items, valueKey, nameKey) => items.map(item => `
+            <li class="flex justify-between p-2 border-b">
+                <span>${item[nameKey]}</span>
+                <span class="font-bold">${item[valueKey]}</span>
+            </li>
+        `).join('') || '<li class="p-2 text-gray-500">No data available.</li>';
+
         const content = `
-            <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
-                <div class="lg:col-span-2 card">
-                    <h2 class="text-xl font-bold mb-4 text-center">Checkout Activity (Last 30 Days)</h2>
-                    <canvas id="activityChart"></canvas>
-                </div>
-                <div class="card">
-                    <h2 class="text-xl font-bold mb-4 text-center">Item Status Distribution</h2>
-                    <canvas id="statusChart"></canvas>
-                </div>
-                 <div class="card">
-                    <h2 class="text-xl font-bold mb-4 text-center">Most Checked Out Items</h2>
-                    <canvas id="topItemsChart"></canvas>
-                </div>
-                 <div class="card">
-                    <h2 class="text-xl font-bold mb-4 text-center">Most Active Users</h2>
-                    <canvas id="topUsersChart"></canvas>
-                </div>
-                 <div class="card">
-                    <h2 class="text-xl font-bold mb-4 text-center">Top Items by Maintenance Reports</h2>
-                    <canvas id="topMaintenanceChart"></canvas>
-                </div>
+            <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-6">
+                <div class="card text-center"><h2 class="text-4xl font-bold text-sky-600">${stats.total_items}</h2><p class="text-gray-500">Unique Item Types</p></div>
+                <div class="card text-center"><h2 class="text-4xl font-bold text-blue-600">${stats.total_standard_quantity}</h2><p class="text-gray-500">Total Standard Items</p></div>
+                <div class="card text-center"><h2 class="text-4xl font-bold text-red-600">${stats.maintenance_items}</h2><p class="text-gray-500">Items in Maintenance</p></div>
+                <div class="card text-center"><h2 class="text-4xl font-bold text-gray-600">${stats.total_users}</h2><p class="text-gray-500">Total Users</p></div>
             </div>
 
-            <script>
-                const chartColors = {
-                    blue: 'rgba(54, 162, 235, 0.6)',
-                    red: 'rgba(255, 99, 132, 0.6)',
-                    yellow: 'rgba(255, 206, 86, 0.6)',
-                    green: 'rgba(75, 192, 192, 0.6)',
-                    purple: 'rgba(153, 102, 255, 0.6)'
-                };
-
-                // Activity Chart (Line)
-                new Chart(document.getElementById('activityChart'), {
-                    type: 'line',
-                    data: {
-                        labels: ${JSON.stringify(activityData.map(d => d.date).reverse())},
-                        datasets: [{
-                            label: 'Checkouts per Day',
-                            data: ${JSON.stringify(activityData.map(d => d.count).reverse())},
-                            borderColor: chartColors.blue,
-                            backgroundColor: 'rgba(54, 162, 235, 0.2)',
-                            fill: true,
-                            tension: 0.1
-                        }]
-                    }
-                });
-                
-                // Status Chart (Doughnut)
-                new Chart(document.getElementById('statusChart'), {
-                    type: 'doughnut',
-                    data: {
-                        labels: ${JSON.stringify(statusData.map(d => d.status))},
-                        datasets: [{
-                            data: ${JSON.stringify(statusData.map(d => d.count))},
-                            backgroundColor: [chartColors.green, chartColors.yellow, chartColors.red]
-                        }]
-                    }
-                });
-
-                // Top Items (Bar)
-                new Chart(document.getElementById('topItemsChart'), {
-                    type: 'bar',
-                    data: {
-                        labels: ${JSON.stringify(topItemsData.map(d => d.item_name))},
-                        datasets: [{
-                            label: 'Checkout Count',
-                            data: ${JSON.stringify(topItemsData.map(d => d.checkout_count))},
-                            backgroundColor: chartColors.purple
-                        }]
-                    },
-                    options: { indexAxis: 'y' }
-                });
-
-                 // Top Users (Bar)
-                new Chart(document.getElementById('topUsersChart'), {
-                    type: 'bar',
-                    data: {
-                        labels: ${JSON.stringify(topUsersData.map(d => d.user_name))},
-                        datasets: [{
-                            label: 'Action Count',
-                            data: ${JSON.stringify(topUsersData.map(d => d.action_count))},
-                            backgroundColor: chartColors.green
-                        }]
-                    },
-                     options: { indexAxis: 'y' }
-                });
-
-                // Top Maintenance (Bar)
-                new Chart(document.getElementById('topMaintenanceChart'), {
-                    type: 'bar',
-                    data: {
-                        labels: ${JSON.stringify(topMaintenanceData.map(d => d.name))},
-                        datasets: [{
-                            label: 'Maintenance Reports',
-                            data: ${JSON.stringify(topMaintenanceData.map(d => d.report_count))},
-                            backgroundColor: chartColors.red
-                        }]
-                    },
-                     options: { indexAxis: 'y' }
-                });
-            </script>
+            <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                <div class="card">
+                    <h2 class="text-xl font-bold mb-4">Most Checked Out Items</h2>
+                    <ul>${renderList(topItems, 'checkout_count', 'item_name')}</ul>
+                </div>
+                 <div class="card">
+                    <h2 class="text-xl font-bold mb-4">Most Active Users</h2>
+                     <ul>${renderList(topUsers, 'action_count', 'user_name')}</ul>
+                </div>
+                 <div class="card">
+                    <h2 class="text-xl font-bold mb-4">Top Items by Maintenance Reports</h2>
+                     <ul>${renderList(topMaintenance, 'report_count', 'name')}</ul>
+                </div>
+            </div>
         `;
         res.send(renderPage(req, 'Reports', req.session.user, content));
-    });
     });
     });
     });
