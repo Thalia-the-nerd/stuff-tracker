@@ -2,31 +2,25 @@
  * =================================================================
  * Miami Beach Senior High Robotics Team - Inventory Tracker
  * =================================================================
- * Version: 3.0.9 (Automatic Backups Update)
+ * Version: 3.1.0 (Reporting and Reservations Overhaul)
  * Author: Thalia (with fixes by Gemini)
  * Description: A complete, single-file Node.js application to manage
  * team inventory with advanced admin controls and a refreshed UI.
+ *
+ * Change Log (v3.1.0):
+ * - ADDED: Reservations can now be made for a specific quantity of an item.
+ * - ADDED: Reservation logic now checks availability based on the quantity of an item reserved on any given day.
+ * - MODIFIED: The Admin Reports page has been completely redesigned with new analytics, including:
+ * - Checkout activity over the last 30 days (line chart).
+ * - Most frequently checked-out items (bar chart).
+ * - Most active users by action count (bar chart).
+ * - Items with the most maintenance reports (bar chart).
  *
  * Change Log (v3.0.9):
  * - ADDED: Automatic database backups. Hourly backups are kept for 7 days,
  * and permanent backups are created every 36 hours.
  * - NOTE: This feature requires the 'node-cron' package (`npm install node-cron`).
  *
- * Change Log (v3.0.8):
- * - MODIFIED: All authenticated users can now create and edit items.
- * - MODIFIED: The delete item functionality remains restricted to admins and managers.
- *
- * Change Log (v3.0.7):
- * - FIXED: A critical logic bug where checking in a multi-quantity item would incorrectly keep its status as "Checked Out".
- * - REMOVED: Dark mode was reverted to the default light theme.
- *
- * Change Log (v3.0.5):
- * - ADDED: Item "Kit" functionality. Items can be designated as kits and require other items as components.
- * - ADDED: Checkout logic now validates that all kit components are available. Checking out a kit checks out all its components.
- * - ADDED: UI for managing kit components on the item edit page.
- * - ADDED: Sorting functionality to the main inventory table (sort by ID, name, category, status).
- * - IMPROVED: Quantity tracking. Items with multiple quantities now show how many are checked out (e.g., "1/3 Checked Out").
- * - SECURITY: Session secret is now loaded from an environment variable (`process.env.SESSION_SECRET`).
  * =================================================================
  */
 
@@ -137,6 +131,7 @@ function initializeDb() { //sometimes it needs to be restarted after editing rol
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             item_id INTEGER NOT NULL,
             user_id INTEGER NOT NULL,
+            quantity INTEGER NOT NULL DEFAULT 1,
             start_date DATE NOT NULL,
             end_date DATE NOT NULL,
             status TEXT DEFAULT 'Active' CHECK(status IN ('Active', 'Completed', 'Cancelled')),
@@ -211,6 +206,7 @@ function initializeDb() { //sometimes it needs to be restarted after editing rol
         checkAndAddColumn('reservations', 'extension_status', "TEXT DEFAULT 'None' CHECK(extension_status IN ('None', 'Pending', 'Approved', 'Denied'))");
         checkAndAddColumn('reservations', 'requested_end_date', 'DATE');
         checkAndAddColumn('reservations', 'extension_reason', 'TEXT');
+        checkAndAddColumn('reservations', 'quantity', 'INTEGER NOT NULL DEFAULT 1');
         checkAndAddColumn('items', 'is_kit', 'BOOLEAN DEFAULT 0');
         checkAndAddColumn('items', 'quantity_checked_out', 'INTEGER DEFAULT 0');
 
@@ -1488,7 +1484,7 @@ app.get('/reservations', requireLogin, (req, res) => {
     const nextYear = month === 11 ? year + 1 : year;
 
     const sql = `
-        SELECT r.id, r.start_date, r.end_date, i.name as item_name, u.name as user_name, r.user_id
+        SELECT r.id, r.start_date, r.end_date, r.quantity, i.name as item_name, u.name as user_name, r.user_id
         FROM reservations r
         JOIN items i ON r.item_id = i.id
         JOIN users u ON r.user_id = u.id
@@ -1499,7 +1495,7 @@ app.get('/reservations', requireLogin, (req, res) => {
     const endDateStr = `${year}-${String(month + 1).padStart(2, '0')}-${lastDay.getDate()}`;
 
     db.all(sql, [startDateStr, endDateStr, startDateStr, endDateStr], (err, reservations) => {
-        db.all('SELECT id, name FROM items ORDER BY name', (err, items) => {
+        db.all('SELECT id, name, quantity FROM items WHERE quantity > 0 ORDER BY name', (err, items) => {
 
             let calendarHtml = '';
             const daysInMonth = lastDay.getDate();
@@ -1524,7 +1520,7 @@ app.get('/reservations', requireLogin, (req, res) => {
                       }
                       return `
                         <li class="bg-sky-100 p-1 rounded">
-                            <p class="font-semibold">${r.item_name}</p>
+                            <p class="font-semibold">${r.item_name} (x${r.quantity})</p>
                             <p>${r.user_name} ${cancelForm}</p>
                         </li>`;
                 }).join('');
@@ -1536,6 +1532,11 @@ app.get('/reservations', requireLogin, (req, res) => {
                     </ul>
                 </div>`;
             }
+            
+            const itemsData = JSON.stringify(items.reduce((acc, item) => {
+                acc[item.id] = item.quantity;
+                return acc;
+            }, {}));
 
             const content = `
                 <div class="grid grid-cols-1 xl:grid-cols-3 gap-6">
@@ -1561,9 +1562,13 @@ app.get('/reservations', requireLogin, (req, res) => {
                         <form action="/reservations" method="POST">
                             <div class="mb-4">
                                 <label class="block">Item</label>
-                                <select name="item_id" class="w-full p-2 border rounded" required>
+                                <select name="item_id" id="item_id_select" class="w-full p-2 border rounded" required>
                                     ${items.map(i => `<option value="${i.id}">${i.name}</option>`).join('')}
                                 </select>
+                            </div>
+                            <div class="mb-4">
+                                <label class="block">Quantity</label>
+                                <input type="number" name="quantity" id="quantity_input" value="1" min="1" class="w-full p-2 border rounded" required>
                             </div>
                             <div class="mb-4">
                                 <label class="block">Start Date</label>
@@ -1579,9 +1584,22 @@ app.get('/reservations', requireLogin, (req, res) => {
                     </div>
                 </div>
                 <script>
+                    const itemData = ${itemsData};
+                    const itemSelect = document.getElementById('item_id_select');
+                    const quantityInput = document.getElementById('quantity_input');
                     const startDateInput = document.getElementById('start_date');
                     const endDateInput = document.getElementById('end_date');
                     
+                    function updateQuantityMax() {
+                        const selectedItemId = itemSelect.value;
+                        if (itemData[selectedItemId]) {
+                            quantityInput.max = itemData[selectedItemId];
+                        }
+                    }
+                    
+                    itemSelect.addEventListener('change', updateQuantityMax);
+                    document.addEventListener('DOMContentLoaded', updateQuantityMax);
+
                     startDateInput.addEventListener('change', () => {
                         if (!startDateInput.value) return;
                         
@@ -1603,7 +1621,8 @@ app.get('/reservations', requireLogin, (req, res) => {
 
 app.post('/reservations', requireLogin, (req, res) => {
     const { item_id, start_date, end_date } = req.body;
-    
+    const quantity = parseInt(req.body.quantity, 10);
+
     const startDate = new Date(start_date);
     const endDate = new Date(end_date);
     const diffTime = Math.abs(endDate - startDate);
@@ -1613,27 +1632,67 @@ app.post('/reservations', requireLogin, (req, res) => {
         req.session.error = `Reservation cannot be longer than ${RESERVATION_LIMIT_DAYS} days.`;
         return res.redirect('/reservations');
     }
+
+    if (!quantity || quantity < 1) {
+        req.session.error = "Invalid quantity specified.";
+        return res.redirect('/reservations');
+    }
     
-    const sql = `SELECT id FROM reservations WHERE item_id = ? AND status = 'Active' AND (
-        (start_date <= ? AND end_date >= ?) OR (start_date BETWEEN ? AND ?)
-    )`;
-    db.get(sql, [item_id, start_date, start_date, start_date, end_date], (err, existing) => {
-        if (existing) {
-            req.session.error = "This item is already reserved during the selected dates.";
+    // Check for availability
+    db.get('SELECT quantity FROM items WHERE id = ?', [item_id], (err, item) => {
+        if (err || !item) {
+            req.session.error = "Selected item not found.";
             return res.redirect('/reservations');
         }
-        db.run('INSERT INTO reservations (item_id, user_id, start_date, end_date) VALUES (?, ?, ?, ?)',
-            [item_id, req.session.user.id, start_date, end_date], function(err) {
+
+        const totalAvailable = item.quantity;
+        if (quantity > totalAvailable) {
+            req.session.error = `Cannot reserve ${quantity} items. Only ${totalAvailable} exist.`;
+            return res.redirect('/reservations');
+        }
+
+        // Find the maximum number of items already reserved on any single day within the requested range.
+        const sql = `
+            SELECT r.start_date, r.end_date, r.quantity 
+            FROM reservations r
+            WHERE r.item_id = ? AND r.status = 'Active' AND r.end_date >= ? AND r.start_date <= ?
+        `;
+
+        db.all(sql, [item_id, start_date, end_date], (err, overlappingReservations) => {
             if (err) {
-                req.session.error = "Failed to create reservation.";
-                res.redirect('/reservations');
-            } else {
-                db.get('SELECT name FROM items WHERE id = ?', [item_id], (err, item) => {
-                    req.session.success = "Reservation created successfully.";
-                    logAction(req.session.user, 'Created Reservation', item, `For ${start_date} to ${end_date}`, req.ip);
-                    res.redirect('/reservations');
-                });
+                req.session.error = "Error checking for reservation conflicts.";
+                return res.redirect('/reservations');
             }
+
+            for (let d = new Date(startDate); d <= endDate; d.setDate(d.getDate() + 1)) {
+                let reservedOnDay = 0;
+                for (const existing of overlappingReservations) {
+                    const existingStart = new Date(existing.start_date);
+                    const existingEnd = new Date(existing.end_date);
+                    if (d >= existingStart && d <= existingEnd) {
+                        reservedOnDay += existing.quantity;
+                    }
+                }
+                
+                if (reservedOnDay + quantity > totalAvailable) {
+                    const dateString = d.toLocaleDateString();
+                    req.session.error = `Not enough items available on ${dateString}. ${totalAvailable - reservedOnDay} available, you requested ${quantity}.`;
+                    return res.redirect('/reservations');
+                }
+            }
+
+            // If we get here, the quantity is available for the whole duration
+            db.run('INSERT INTO reservations (item_id, user_id, quantity, start_date, end_date) VALUES (?, ?, ?, ?, ?)',
+                [item_id, req.session.user.id, quantity, start_date, end_date], function(err) {
+                if (err) {
+                    req.session.error = "Failed to create reservation.";
+                    res.redirect('/reservations');
+                } else {
+                    req.session.success = "Reservation created successfully.";
+                    logAction(req.session.user, 'Created Reservation', { id: item_id, name: item.name }, `Quantity: ${quantity} for ${start_date} to ${end_date}`, req.ip);
+                    res.redirect('/reservations');
+                }
+            });
         });
     });
 });
@@ -1676,7 +1735,7 @@ app.get('/my-reservations', requireLogin, (req, res) => {
 
             return `
                 <div class="card mb-4">
-                    <h3 class="text-lg font-bold">${r.item_name}</h3>
+                    <h3 class="text-lg font-bold">${r.item_name} (x${r.quantity})</h3>
                     <p><strong>From:</strong> ${r.start_date} <strong>To:</strong> ${r.end_date}</p>
                     <p><strong>Status:</strong> ${r.status}</p>
                     ${extensionHtml}
@@ -1732,67 +1791,129 @@ app.post('/reservations/cancel/:id', requireLogin, (req, res) => {
 // --- Admin Pages ---
 app.get('/reports', requireRole(['admin', 'manager']), (req, res) => {
     const queries = {
-        itemsByCategory: "SELECT category, COUNT(*) as count FROM items GROUP BY category",
-        itemsByLocation: "SELECT l.name as location, COUNT(i.id) as count FROM locations l LEFT JOIN items i ON l.id = i.location_id GROUP BY l.name",
-        itemStatus: "SELECT status, COUNT(*) as count FROM items GROUP BY status"
+        itemStatus: "SELECT status, COUNT(*) as count FROM items GROUP BY status",
+        checkoutActivity: "SELECT strftime('%Y-%m-%d', timestamp) as date, COUNT(*) as count FROM audit_log WHERE action LIKE 'Checked Out%' GROUP BY date ORDER BY date DESC LIMIT 30",
+        topUsers: "SELECT user_name, COUNT(*) as action_count FROM audit_log WHERE user_id IS NOT NULL GROUP BY user_id, user_name ORDER BY action_count DESC LIMIT 5",
+        topItems: "SELECT item_name, COUNT(*) as checkout_count FROM audit_log WHERE action LIKE 'Checked Out%' AND item_id IS NOT NULL GROUP BY item_id, item_name ORDER BY checkout_count DESC LIMIT 5",
+        topMaintenance: "SELECT i.name, COUNT(ml.id) as report_count FROM maintenance_log ml JOIN items i ON ml.item_id = i.id GROUP BY ml.item_id, i.name ORDER BY report_count DESC LIMIT 5"
     };
 
-    db.all(queries.itemsByCategory, (err, categoryData) => {
-    db.all(queries.itemsByLocation, (err, locationData) => {
     db.all(queries.itemStatus, (err, statusData) => {
+    db.all(queries.checkoutActivity, (err, activityData) => {
+    db.all(queries.topUsers, (err, topUsersData) => {
+    db.all(queries.topItems, (err, topItemsData) => {
+    db.all(queries.topMaintenance, (err, topMaintenanceData) => {
+        if (err) {
+            return res.status(500).send(renderPage(req, 'Error', req.session.user, 'Could not load report data.'));
+        }
+
         const content = `
             <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
-                <div class="card">
-                    <h2 class="text-xl font-bold mb-4 text-center">Items by Category</h2>
-                    <canvas id="categoryChart"></canvas>
+                <div class="lg:col-span-2 card">
+                    <h2 class="text-xl font-bold mb-4 text-center">Checkout Activity (Last 30 Days)</h2>
+                    <canvas id="activityChart"></canvas>
                 </div>
-                 <div class="card">
+                <div class="card">
                     <h2 class="text-xl font-bold mb-4 text-center">Item Status Distribution</h2>
                     <canvas id="statusChart"></canvas>
                 </div>
-                 <div class="card lg:col-span-2">
-                    <h2 class="text-xl font-bold mb-4 text-center">Items by Location</h2>
-                    <canvas id="locationChart"></canvas>
+                 <div class="card">
+                    <h2 class="text-xl font-bold mb-4 text-center">Most Checked Out Items</h2>
+                    <canvas id="topItemsChart"></canvas>
+                </div>
+                 <div class="card">
+                    <h2 class="text-xl font-bold mb-4 text-center">Most Active Users</h2>
+                    <canvas id="topUsersChart"></canvas>
+                </div>
+                 <div class="card">
+                    <h2 class="text-xl font-bold mb-4 text-center">Top Items by Maintenance Reports</h2>
+                    <canvas id="topMaintenanceChart"></canvas>
                 </div>
             </div>
 
             <script>
-                const categoryData = {
-                    labels: ${JSON.stringify(categoryData.map(d => d.category || 'Uncategorized'))},
-                    datasets: [{
-                        label: 'Items',
-                        data: ${JSON.stringify(categoryData.map(d => d.count))},
-                        backgroundColor: ['#38bdf8', '#fbbf24', '#f87171', '#4ade80', '#a78bfa', '#fb923c']
-                    }]
+                const chartColors = {
+                    blue: 'rgba(54, 162, 235, 0.6)',
+                    red: 'rgba(255, 99, 132, 0.6)',
+                    yellow: 'rgba(255, 206, 86, 0.6)',
+                    green: 'rgba(75, 192, 192, 0.6)',
+                    purple: 'rgba(153, 102, 255, 0.6)'
                 };
-                new Chart(document.getElementById('categoryChart'), { type: 'pie', data: categoryData });
 
-                const statusData = {
-                    labels: ${JSON.stringify(statusData.map(d => d.status))},
-                    datasets: [{
-                        label: 'Status',
-                        data: ${JSON.stringify(statusData.map(d => d.count))},
-                        backgroundColor: ['#4ade80', '#fbbf24', '#f87171']
-                    }]
-                };
-                new Chart(document.getElementById('statusChart'), { type: 'doughnut', data: statusData });
+                // Activity Chart (Line)
+                new Chart(document.getElementById('activityChart'), {
+                    type: 'line',
+                    data: {
+                        labels: ${JSON.stringify(activityData.map(d => d.date).reverse())},
+                        datasets: [{
+                            label: 'Checkouts per Day',
+                            data: ${JSON.stringify(activityData.map(d => d.count).reverse())},
+                            borderColor: chartColors.blue,
+                            backgroundColor: 'rgba(54, 162, 235, 0.2)',
+                            fill: true,
+                            tension: 0.1
+                        }]
+                    }
+                });
+                
+                // Status Chart (Doughnut)
+                new Chart(document.getElementById('statusChart'), {
+                    type: 'doughnut',
+                    data: {
+                        labels: ${JSON.stringify(statusData.map(d => d.status))},
+                        datasets: [{
+                            data: ${JSON.stringify(statusData.map(d => d.count))},
+                            backgroundColor: [chartColors.green, chartColors.yellow, chartColors.red]
+                        }]
+                    }
+                });
 
-                const locationData = {
-                    labels: ${JSON.stringify(locationData.map(d => d.location))},
-                    datasets: [{
-                        label: 'Number of Items',
-                        data: ${JSON.stringify(locationData.map(d => d.count))},
-                        backgroundColor: '#0ea5e9'
-                    }]
-                };
-                new Chart(document.getElementById('locationChart'), {
+                // Top Items (Bar)
+                new Chart(document.getElementById('topItemsChart'), {
                     type: 'bar',
-                    data: locationData,
-                    options: { scales: { y: { beginAtZero: true } } }
+                    data: {
+                        labels: ${JSON.stringify(topItemsData.map(d => d.item_name))},
+                        datasets: [{
+                            label: 'Checkout Count',
+                            data: ${JSON.stringify(topItemsData.map(d => d.checkout_count))},
+                            backgroundColor: chartColors.purple
+                        }]
+                    },
+                    options: { indexAxis: 'y' }
+                });
+
+                 // Top Users (Bar)
+                new Chart(document.getElementById('topUsersChart'), {
+                    type: 'bar',
+                    data: {
+                        labels: ${JSON.stringify(topUsersData.map(d => d.user_name))},
+                        datasets: [{
+                            label: 'Action Count',
+                            data: ${JSON.stringify(topUsersData.map(d => d.action_count))},
+                            backgroundColor: chartColors.green
+                        }]
+                    },
+                     options: { indexAxis: 'y' }
+                });
+
+                // Top Maintenance (Bar)
+                new Chart(document.getElementById('topMaintenanceChart'), {
+                    type: 'bar',
+                    data: {
+                        labels: ${JSON.stringify(topMaintenanceData.map(d => d.name))},
+                        datasets: [{
+                            label: 'Maintenance Reports',
+                            data: ${JSON.stringify(topMaintenanceData.map(d => d.report_count))},
+                            backgroundColor: chartColors.red
+                        }]
+                    },
+                     options: { indexAxis: 'y' }
                 });
             </script>
         `;
         res.send(renderPage(req, 'Reports', req.session.user, content));
+    });
+    });
     });
     });
     });
@@ -1907,7 +2028,7 @@ app.get('/admin/all-reservations', requireRole(['admin', 'manager']), (req, res)
     db.all(sql, [], (err, all_reservations) => {
         const reservationsHtml = all_reservations.map(r => `
              <tr class="border-b">
-                <td class="p-2">${r.item_name}</td>
+                <td class="p-2">${r.item_name} (x${r.quantity})</td>
                 <td class="p-2">${r.user_name}</td>
                 <td class="p-2">${r.start_date}</td>
                 <td class="p-2">${r.end_date}</td>
@@ -2662,4 +2783,5 @@ app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server running on http://0.0.0.0:${PORT}`);
     console.log(`For Miami Beach Senior High Robotics Team`);
 });
+
 
